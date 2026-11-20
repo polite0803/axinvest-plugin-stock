@@ -1,0 +1,1231 @@
+//! 技术指标纯函数模块（SMA / EMA / RSI / stddev）
+//!
+//! P2-C7: 将原本散落在 `astock-data`、`quant`、`market-sim`、`stock-analysis`
+//! 的重复实现统一收口到 harness foundation 层。所有共享数据模型的 crate
+//! （implementor / consumer / hybrid / wiring）均可通过 `pub use` 引用，
+//! 消除 DRY 违规，确保算法一致性。
+//!
+//! ## 算法约定
+//!
+//! - **SMA**: 取最近 `period` 个数据的算术平均；数据不足返回 `None`
+//! - **EMA 序列**: 首值用前 `period` 个数据的 SMA 初始化（标准 EMA 初始化），
+//!   返回与输入等长的序列
+//! - **RSI (Wilder 平滑)**: 首轮简单平均，后续用 `(n-1)/n` 指数平滑；
+//!   数据不足（`len < period + 1` 或 `period == 0`）返回 `None`
+//! - **样本标准差**: n-1 分母（Bessel 校正），用于布林带等统计场景
+//!
+//! ## 返回值语义
+//!
+//! - `Option<f64>` 版本：数据不足返回 `None`，调用方自行决定中性默认值
+//! - 序列版本：输入为空或 `period == 0` 返回 `vec![0.0]`（保持与历史调用方兼容）
+//!
+//! ## 不变量
+//!
+//! - 所有函数对 `period == 0` 做防御性处理，不会 panic
+//! - 输入为空切片时不会 panic
+//! - 不依赖任何外部 crate，仅用 std（符合 foundation 层零 axagent-* 依赖约束）
+
+// ===================== SMA =====================
+
+/// 简单移动平均（取最后 `period` 个数据点的算术平均）
+///
+/// - 数据不足（`data.len() < period`）或 `period == 0` 时返回 `None`
+/// - 调用方需自行决定回退值（如用最新收盘价或 50.0 中性值）
+///
+/// # 示例
+///
+/// ```
+/// use axagent_harness::indicators::sma;
+/// assert_eq!(sma(&[1.0, 2.0, 3.0, 4.0], 2), Some(3.5));
+/// assert_eq!(sma(&[1.0, 2.0], 5), None);
+/// assert_eq!(sma(&[1.0, 2.0, 3.0], 0), None);
+/// ```
+pub fn sma(data: &[f64], period: usize) -> Option<f64> {
+    if data.len() < period || period == 0 {
+        return None;
+    }
+    let start = data.len() - period;
+    Some(data[start..].iter().sum::<f64>() / period as f64)
+}
+
+// ===================== EMA =====================
+
+/// 构建完整 EMA 序列（与输入等长）
+///
+/// 首值用前 `period` 个数据的 SMA 初始化（标准 EMA 初始化），
+/// 后续按 `multiplier = 2 / (period + 1)` 递推。
+///
+/// - 输入为空或 `period == 0` 时返回 `vec![0.0]`（保持与历史调用方兼容）
+/// - 返回序列长度等于输入长度
+///
+/// # 示例
+///
+/// ```
+/// use axagent_harness::indicators::build_ema_series;
+/// let series = build_ema_series(&[1.0, 2.0, 3.0, 4.0], 2);
+/// assert_eq!(series.len(), 4);
+/// // 首值 = SMA(1, 2) = 1.5
+/// assert!((series[0] - 1.5).abs() < 1e-10);
+/// ```
+pub fn build_ema_series(data: &[f64], period: usize) -> Vec<f64> {
+    if data.is_empty() || period == 0 {
+        return vec![0.0];
+    }
+    let multiplier = 2.0 / (period as f64 + 1.0);
+    let mut result = Vec::with_capacity(data.len());
+    let init_n = period.min(data.len());
+    let init_sma: f64 = data[..init_n].iter().sum::<f64>() / init_n as f64;
+    let mut ema_val = init_sma;
+    result.push(ema_val);
+    for &val in &data[1..] {
+        ema_val = (val - ema_val) * multiplier + ema_val;
+        result.push(ema_val);
+    }
+    result
+}
+
+/// 仅取 EMA 序列的末值（便捷函数）
+///
+/// 等价于 `build_ema_series(data, period).last().copied().unwrap_or(0.0)`，
+/// 但避免分配整个 Vec。数据为空时返回 `0.0`。
+#[inline]
+pub fn ema_last(data: &[f64], period: usize) -> f64 {
+    if data.is_empty() || period == 0 {
+        return 0.0;
+    }
+    let multiplier = 2.0 / (period as f64 + 1.0);
+    let init_n = period.min(data.len());
+    let init_sma: f64 = data[..init_n].iter().sum::<f64>() / init_n as f64;
+    let mut ema_val = init_sma;
+    for &val in &data[1..] {
+        ema_val = (val - ema_val) * multiplier + ema_val;
+    }
+    ema_val
+}
+
+// ===================== RSI (Wilder 平滑) =====================
+
+/// RSI 指标（Wilder 平滑法）
+///
+/// 首轮对前 `period` 个涨跌幅做简单平均，后续用 `(n-1)/n` 指数平滑。
+/// 数据不足（`len < period + 1` 或 `period == 0`）返回 `None`，
+/// 调用方自行决定中性默认值（如 50.0）。
+///
+/// # 边界情况
+///
+/// - `avg_loss < 1e-10`（持续上涨无回调）返回 `Some(100.0)`
+/// - 数据不足返回 `None`
+///
+/// # 示例
+///
+/// ```
+/// use axagent_harness::indicators::rsi_wilder;
+/// // 持续上涨 → RSI = 100
+/// let closes = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+/// assert_eq!(rsi_wilder(&closes, 5), Some(100.0));
+/// // 数据不足
+/// assert_eq!(rsi_wilder(&[1.0, 2.0], 5), None);
+/// ```
+pub fn rsi_wilder(closes: &[f64], period: usize) -> Option<f64> {
+    if closes.len() < period + 1 || period == 0 {
+        return None;
+    }
+    let mut avg_gain = 0.0;
+    let mut avg_loss = 0.0;
+    for i in 1..=period {
+        let diff = closes[i] - closes[i - 1];
+        if diff > 0.0 {
+            avg_gain += diff;
+        } else {
+            avg_loss += -diff;
+        }
+    }
+    avg_gain /= period as f64;
+    avg_loss /= period as f64;
+    for i in (period + 1)..closes.len() {
+        let diff = closes[i] - closes[i - 1];
+        let gain = if diff > 0.0 { diff } else { 0.0 };
+        let loss = if diff < 0.0 { -diff } else { 0.0 };
+        avg_gain = (avg_gain * (period - 1) as f64 + gain) / period as f64;
+        avg_loss = (avg_loss * (period - 1) as f64 + loss) / period as f64;
+    }
+    // 修复 L5: 区分「持续上涨」与「完全平盘」
+    //   - 持续上涨（avg_gain>0, avg_loss≈0）→ RSI=100（超买）
+    //   - 完全平盘（avg_gain≈0 且 avg_loss≈0）→ RSI=50（中性），避免平盘误报极端超买
+    if avg_loss < 1e-10 {
+        return if avg_gain < 1e-10 {
+            Some(50.0)
+        } else {
+            Some(100.0)
+        };
+    }
+    let rs = avg_gain / avg_loss;
+    Some(100.0 - (100.0 / (1.0 + rs)))
+}
+
+// ===================== 样本标准差 =====================
+
+/// 样本标准差（n-1 分母，Bessel 校正）
+///
+/// 用于布林带等统计场景。数据少于 2 个返回 `0.0`。
+///
+/// # 示例
+///
+/// ```
+/// use axagent_harness::indicators::stddev_sample;
+/// let data = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+/// let mean = data.iter().sum::<f64>() / data.len() as f64;
+/// let sd = stddev_sample(&data, mean);
+/// assert!((sd - 2.138).abs() < 0.01);
+/// ```
+pub fn stddev_sample(data: &[f64], mean: f64) -> f64 {
+    let n = data.len() as f64;
+    if n < 2.0 {
+        return 0.0;
+    }
+    let variance = data.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    variance.sqrt()
+}
+
+// ===================== Sharpe Ratio（P3-C8 统一实现）=====================
+
+/// A 股每年实际交易日数（约 244 天，而非美股的 252 天）。
+///
+/// P3-C8: 将原本散落在 `stock-analysis/risk.rs` (252)、`astock-data/mcp_tools.rs` (252)、
+/// `tools/finance.rs` (252)、`quant/metrics.rs` (244) 的年化因子统一收口。
+/// 所有 A 股相关计算应使用本常量，避免 252/244 混用导致的 Sharpe / 波动率偏差。
+pub const A_SHARE_TRADING_DAYS_PER_YEAR: f64 = 244.0;
+
+/// 默认年无风险利率（2.5%，参考 10 年期国债收益率中枢）。
+///
+/// 各调用方可根据自身语义覆盖（如 `astock-data/mcp_tools.rs` 历史使用 3.0%）。
+pub const RISK_FREE_ANNUAL_DEFAULT: f64 = 0.025;
+
+/// Sharpe 计算的完整结果（与历史 `SharpeResult` / `SharpeR` 字段对齐）。
+///
+/// P3-C8: 统一 DTO，消除 stock-analysis/risk.rs `SharpeResult` 与 tools/finance.rs `SharpeR`
+/// 两套同义结构体的 DRY 违规。下游 crate 通过 `pub use axagent_harness::indicators::SharpeComponents`
+/// 复用，避免重复定义。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SharpeComponents {
+    /// 日频 Sharpe：(mean - risk_free_daily) / stddev
+    pub sharpe: f64,
+    /// 年化 Sharpe：`sharpe * sqrt(annualization)`
+    pub annualized: f64,
+    /// 日均收益率（原始值，未缩放）
+    pub mean_return: f64,
+    /// 日收益率样本标准差（n-1 分母）
+    pub stddev: f64,
+}
+
+/// 夏普比率核心计算 —— 接受 **日频** 无风险利率。
+///
+/// 统一算法约定：
+/// - 样本方差（n-1 分母，Bessel 校正）
+/// - 数据 < 2 个返回全零 `SharpeComponents`
+/// - `stddev == 0`（常数序列）返回全零，避免除零
+/// - 不做四舍五入，由调用方按需 round（保留精度供下游复用）
+///
+/// # 参数
+///
+/// - `returns`: 日收益率切片（如 0.01 表示 +1%）
+/// - `risk_free_daily`: **日频** 无风险利率（如 0.03/244 ≈ 0.000123）
+/// - `annualization`: 年化因子（A 股 = 244，美股 = 252，周频 = 52，月频 = 12）
+///
+/// # 示例
+///
+/// ```
+/// use axagent_harness::indicators::{sharpe_components, A_SHARE_TRADING_DAYS_PER_YEAR};
+/// let returns = vec![0.01, 0.02, -0.01, 0.005, 0.015];
+/// let r = sharpe_components(&returns, 0.03 / A_SHARE_TRADING_DAYS_PER_YEAR, A_SHARE_TRADING_DAYS_PER_YEAR);
+/// assert!(r.sharpe > 0.0, "正均值应有正 sharpe");
+/// assert!(r.annualized > r.sharpe, "年化值应放大");
+/// ```
+pub fn sharpe_components(
+    returns: &[f64],
+    risk_free_daily: f64,
+    annualization: f64,
+) -> SharpeComponents {
+    let n = returns.len();
+    if n < 2 {
+        return SharpeComponents { sharpe: 0.0, annualized: 0.0, mean_return: 0.0, stddev: 0.0 };
+    }
+    let mean: f64 = returns.iter().sum::<f64>() / n as f64;
+    let variance: f64 = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+    let stddev = variance.sqrt();
+    if stddev == 0.0 {
+        return SharpeComponents { sharpe: 0.0, annualized: 0.0, mean_return: mean, stddev: 0.0 };
+    }
+    let excess = mean - risk_free_daily;
+    let sharpe = excess / stddev;
+    let annualized = sharpe * annualization.sqrt();
+    SharpeComponents { sharpe, annualized, mean_return: mean, stddev }
+}
+
+/// 便捷函数：A 股日频夏普比率（年化），使用默认 244 天年化。
+///
+/// 等价于 `sharpe_components(returns, risk_free_daily, A_SHARE_TRADING_DAYS_PER_YEAR).annualized`。
+/// 数据不足或常数序列返回 `0.0`。
+#[inline]
+pub fn sharpe_ratio(returns: &[f64], risk_free_daily: f64) -> f64 {
+    sharpe_components(returns, risk_free_daily, A_SHARE_TRADING_DAYS_PER_YEAR).annualized
+}
+
+/// 便捷函数：带自定义年化因子的夏普比率（年化）。
+///
+/// 适用于周频（52）、月频（12）或美股日频（252）等非 A 股场景。
+#[inline]
+pub fn sharpe_ratio_with_annualization(
+    returns: &[f64],
+    risk_free_daily: f64,
+    annualization: f64,
+) -> f64 {
+    sharpe_components(returns, risk_free_daily, annualization).annualized
+}
+
+/// 便捷函数：接受 **年频** 无风险利率的夏普比率（年化）。
+///
+/// 内部将年利率转换为日利率（`risk_free_annual / days_per_year`）后调用核心函数。
+/// 适用于 `quant::metrics::sharpe_ratio(curve, risk_free_annual, days_per_year)` 这类
+/// 以年利率为输入的回测场景。
+#[inline]
+pub fn sharpe_ratio_annual(returns: &[f64], risk_free_annual: f64, days_per_year: f64) -> f64 {
+    if days_per_year <= 0.0 {
+        return 0.0;
+    }
+    let daily_rf = risk_free_annual / days_per_year;
+    sharpe_components(returns, daily_rf, days_per_year).annualized
+}
+
+// ===================== 单元测试 =====================
+
+/// 已实现波动率（**日**，单位 %）：simple return 序列的样本标准差 ×100。
+///
+/// 用途（四周期科学化 Phase D）：止损/止盈不再用「按日线经验拍的固定百分比」，
+/// 而按 `k · σ_daily · √持有天数` 推导 —— 位移的标准差随时间按 √ 增长，
+/// 这是波动率目标法（volatility targeting）与三阶障碍法上下轨设定的共同基础。
+///
+/// 口径：**样本标准差（÷(n−1)）**，与本文件 `sharpe_components` 一致
+/// （该处曾修过 astock-data 的「总体方差 bug」，见 `sharpe_matches_astock_data_legacy_formula_after_fix`）。
+/// 2026-09-29 起 `astock-data/src/regime.rs::volatility` 也委托到本函数 ⇒ 全仓只剩这一份 σ
+/// （切换使 20 日年化波动率整体 ×√(n/(n−1)) ≈ +2.6%，regime 的阈值是**序数口径**，档位不漂移）。
+///
+/// 返回 `None` 的情形（调用方必须显式降级，**不得当成 0 波动**）：
+/// 样本不足 `lookback + 1`、序列含非正价格（收益率无定义）、结果非有限。
+pub fn realized_vol_pct(closes: &[f64], lookback: usize) -> Option<f64> {
+    if lookback < 2 || closes.len() < lookback + 1 {
+        return None;
+    }
+    let slice = &closes[closes.len() - (lookback + 1)..];
+    if slice.iter().any(|c| !c.is_finite() || *c <= 0.0) {
+        return None;
+    }
+    let returns: Vec<f64> = slice.windows(2).map(|w| (w[1] - w[0]) / w[0]).collect();
+    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+    let sd = stddev_sample(&returns, mean);
+    if !sd.is_finite() {
+        return None;
+    }
+    Some(sd * 100.0)
+}
+
+/// 该持有期的**典型位移幅度**（%）= `σ_daily × √持有天数`。
+///
+/// 为什么在 Rust 侧算：本仓共享 Rhai 引擎未注册 `sqrt`/`Math`（脚本内 0 处使用），
+/// 让脚本自己开方要么新增注册面、要么写成幂运算 —— 都不如把这一行放进已带单测的口径函数里。
+/// `σ` 不可得 ⇒ `None`（调用方必须显式降级，见 [`realized_vol_pct`] 的口径说明）。
+pub fn vol_move_pct(closes: &[f64], lookback: usize, holding_days: usize) -> Option<f64> {
+    if holding_days == 0 {
+        return None;
+    }
+    realized_vol_pct(closes, lookback).map(|sigma| sigma * (holding_days as f64).sqrt())
+}
+
+/// 价格在均线波动带内的**标准化位置**（Bollinger 式 z 值）：`(末价 − SMA) / σ_价`。
+///
+/// 用途（P4′-b 的逐档分支）：中档的入场门 `inside_sigma_band` 与长档的「带内/带外」判断
+/// 都要读这个量。**在 Rhai 里现算均值与标准差**就是给 `realized_vol_pct` 造第二份实现
+/// （禁区 12：本仓已为「同一算法两处实现迟早漂移」付过多次代价），所以口径只留这一份。
+///
+/// `σ_价` 用的是**价格本身**的样本标准差（带宽定义如此），与 [`realized_vol_pct`] 的
+/// 「收益率标准差」是两个不同量 —— 前者给「离均线几个带」，后者给「一天动百分之几」。
+///
+/// 返回 `None`（调用方必须显式降级，**不得当成 z=0**）：
+/// 样本不足 `lookback`、窗口含非正/非有限价格、`σ_价 ≈ 0`（停盘或一字板：带宽为 0 时
+/// 「位置」无定义，把它读成「正居中」会把不可得伪装成中性）。
+pub fn band_z(closes: &[f64], lookback: usize) -> Option<f64> {
+    if lookback < 2 || closes.len() < lookback {
+        return None;
+    }
+    let window = &closes[closes.len() - lookback..];
+    if window.iter().any(|c| !c.is_finite() || *c <= 0.0) {
+        return None;
+    }
+    let mean = window.iter().sum::<f64>() / lookback as f64;
+    let sd = stddev_sample(window, mean);
+    if !sd.is_finite() || sd <= f64::EPSILON {
+        return None;
+    }
+    Some((window[window.len() - 1] - mean) / sd)
+}
+
+/// 近 `lookback` 个交易日的**个股强势特征**（P0-5：超短档 breadth 入场门的个股前提）。
+///
+/// 全市场封板率是市场级量（同一天每只票拿到同一个数），单靠它等于「大盘情绪火热时
+/// 任何股票都能过超短买入门」。故门必须再验个股自身：近 N 日**出现过涨停**，或区间累计
+/// 涨幅达到强势股量级。本函数只做这一件事，板块涨跌停幅度由调用方经 `limit_pct`
+/// （百分数，如 10.0 / 20.0 / 30.0 / 5.0）传入，与 `market_data::get_st_price_limit_pct`
+/// 同一把尺子，不在此重复板块判定。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecentStrength {
+    /// 窗口内收盘封死涨停的天数（单日涨幅 ≥ 板块幅度的 95%，容差来自最小报价单位舍入）。
+    pub limit_up_count: usize,
+    /// 区间累计涨幅（百分数）：末收盘相对窗口起点收盘。
+    pub cum_gain_pct: f64,
+    /// 实际评估的交易日数（= 可用 bar 对数，样本不足时小于 lookback）。
+    pub days: usize,
+}
+
+/// 计算 [`RecentStrength`]。`closes` 按时间**升序**（末元素为最新收盘，与
+/// [`vol_move_pct`] / [`band_z`] 的输入约定一致）。
+///
+/// 返回 `None`：`lookback == 0`、可用收盘少于 2 根、或窗口起止价格非正。
+/// 窗口内个别脏价格（≤0 / NaN）只跳过该日配对，不污染计数；但起点或终点非正 ⇒ None
+/// （累计涨幅无定义）。
+pub fn recent_strength(closes: &[f64], limit_pct: f64, lookback: usize) -> Option<RecentStrength> {
+    if lookback == 0 || closes.len() < 2 {
+        return None;
+    }
+    let take = lookback.min(closes.len() - 1) + 1;
+    let window = &closes[closes.len() - take..];
+    let start = *window.first()?;
+    let last = *window.last()?;
+    if !start.is_finite() || start <= 0.0 || !last.is_finite() || last <= 0.0 {
+        return None;
+    }
+    // 挂单涨停价按最小报价单位四舍五入 ⇒ 实收涨幅可略低于板幅（10cm 常见 9.9x%）。
+    // 取板幅的 95% 作封板阈值：10cm→9.5%（与 regime.rs 的 0.095 同值）、
+    // 20cm→19%、5cm(ST)→4.75%。
+    let limit_threshold = (limit_pct * 0.95) / 100.0;
+    let mut limit_up_count = 0usize;
+    let mut days = 0usize;
+    for pair in window.windows(2) {
+        let (prev, curr) = (pair[0], pair[1]);
+        if !prev.is_finite() || prev <= 0.0 || !curr.is_finite() || curr <= 0.0 {
+            continue;
+        }
+        days += 1;
+        if (curr - prev) / prev >= limit_threshold {
+            limit_up_count += 1;
+        }
+    }
+    Some(RecentStrength { limit_up_count, cum_gain_pct: (last / start - 1.0) * 100.0, days })
+}
+
+/// 追涨形态与上方阻力（P1-4，`PLAN-stock-decision-reliability.md` R6）。
+///
+/// 供决策脚本的「大阳放量不追 / 逼近前高不追」两道门使用：本结构只给**客观量**
+/// （涨幅、成交额、分位、前高距离），门阈值（4% / 90 分位 / 5% 带）由脚本侧持有，
+/// 与 `recent_strength` 的分工一致。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurgeState {
+    /// 最近一根 bar 的单日涨幅（百分数）：末收盘相对前收盘。
+    pub last_gain_pct: f64,
+    /// 最近一根 bar 的成交额（与窗口同口径，由调用方构造：`amount` 有效用 amount，
+    /// 否则 `volume × close` 兜底 —— 本仓 K 线 amount 常为 0，见 `pm_avg_turnover`）。
+    pub last_amount: f64,
+    /// 前 `lookback` 根（**不含当日**）成交额的 90 分位（nearest-rank）。
+    /// 有效样本 < 2 根 ⇒ None（分位无定义）。
+    pub amount_p90: Option<f64>,
+    /// 前 `lookback` 根（不含当日）的最高价（前高）。无有效样本 ⇒ None。
+    pub prior_high: Option<f64>,
+    /// 现行价 ÷ 前高（1.0 = 正好触及前高）。None = 前高不可得。
+    pub high_ratio: Option<f64>,
+}
+
+/// 计算 [`SurgeState`]。三个数组按时间**升序**、逐日对齐（本函数按下标配对，
+/// 长度不齐时取最短 —— 调用方应构造等长数组）。
+///
+/// 返回 None：任一数组少于 2 根、或末两根收盘非正/非有限（当日涨幅无定义）。
+/// 窗口内个别脏值（NaN / ≤0）只跳过该日，不污染分位与最高价。
+pub fn surge_state(
+    closes: &[f64],
+    amounts: &[f64],
+    highs: &[f64],
+    lookback: usize,
+) -> Option<SurgeState> {
+    let n = closes.len().min(amounts.len()).min(highs.len());
+    if n < 2 {
+        return None;
+    }
+    let prev_close = closes[n - 2];
+    let last_close = closes[n - 1];
+    if !prev_close.is_finite() || prev_close <= 0.0 || !last_close.is_finite() || last_close <= 0.0
+    {
+        return None;
+    }
+    let last_gain_pct = (last_close / prev_close - 1.0) * 100.0;
+    let last_amount = amounts[n - 1];
+
+    // 前 lookback 根（不含当日）：样本窗口至多 lookback 根
+    let take_start = n.saturating_sub(1 + lookback.max(1));
+
+    let mut prev_amounts: Vec<f64> =
+        amounts[take_start..n - 1].iter().copied().filter(|v| v.is_finite() && *v > 0.0).collect();
+    let amount_p90 = if prev_amounts.len() >= 2 {
+        prev_amounts.sort_by(f64::total_cmp);
+        // nearest-rank：秩 = ceil(0.9 × n)，1-based
+        let rank = ((90 * prev_amounts.len()).div_ceil(100)).max(1).min(prev_amounts.len());
+        Some(prev_amounts[rank - 1])
+    } else {
+        None
+    };
+
+    let prior_high = highs[take_start..n - 1]
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |m| m.max(v))));
+    let high_ratio = prior_high.map(|h| last_close / h);
+
+    Some(SurgeState { last_gain_pct, last_amount, amount_p90, prior_high, high_ratio })
+}
+
+/// SNR 时间折算的**放大上限**（倍数）。
+///
+/// 为什么需要（2026-10-01 实证）：`√(h/anchor)` 的推导前提是「日边缘在整个持有期内
+/// **恒定**」，而该前提在长档并不成立 —— 信号的预测力会随时间衰减（本仓已有
+/// `reflection_stats` 的 `signal_half_life_days`，专门从逐档 rank IC 的指数衰减
+/// 拟合这件事，其存在本身就说明「恒定边缘」只是短窗近似）。
+///
+/// 不加上限时，long 档（90 天 / 锚 28 天）拿到 `√(90/28) = 1.79×`：后验 0.43 这种
+/// **弱看空**会被放大到 0.367（跨过 `ACTION_WATCH_THRESHOLD = 0.38`）⇒ 结构性**只在中/
+/// 长档出票**的趋势智选候选，在分析里恒为「长期减持/卖出」，两个子系统的时间偏好
+/// 精确对冲（用户实测：300604 / 002371 四档恒为 观望/观望/减持/卖出）。
+///
+/// 取 1.5：等价于「放大最多按**一个季度**（63 天）口径」—— `√(63/28) ≈ 1.5`。
+/// 它只截断**超出季度**的部分，故 `short`（0.42）与 `mid`（1.0）行为**逐位不变**，
+/// `long` 仍严格大于 `mid`（「长线更值得」的方向与单调性都保留），
+/// 而弱边缘不再被放大成极端结论。
+///
+/// ⚠ 本常量是**口径常量**（同 `holdings` 的锚定天数），不是标定参数；若将来要按标的 /
+/// 市况调整，应走「参数四道门」进设置面板由反思校准，而不是在调用点各写一个倍数。
+///
+/// ⚠ **未闭合的一致性点**（2026-10-01，留待裁决）：本变更改了**判定口径**，而
+/// `reflection_stats` 的判定口径水印 `snr_anchor_days` 仍写 28 ⇒ 变更前后的 long 档
+/// 样本在 IC 统计里会同池比较。影响面有限（`ic_pairs` 只在**同档内**算秩，故只波及
+/// long 档，且 confidence 幅度差约 2pt），但严格闭合需给水印增加一个**独立的口径版本
+/// 维度**（跨 entity / 前端类型 / 迁移三处），故本次**未擅自展开**，仅在此显式声明该缺口。
+pub const SNR_SCALE_CAP: f64 = 1.5;
+
+/// 把「当前后验胜率」按持有期折算成**该持有期的胜率**（判定侧的时间换空间）。
+///
+/// 依据：恒定日边缘下，信号均值随 h 线性累积、噪声随 √h 累积 ⇒ 信噪比 ∝ √h。
+/// 故以中线为锚做开方折算：`conf = 0.5 + (p − 0.5) × √(h / anchor)`，
+/// h = anchor 时不改；h 更短 ⇒ 边缘向 0.5 收缩；h 更长 ⇒ 边缘放大（**最多
+/// [`SNR_SCALE_CAP`] 倍**，理由见该常量）。
+/// **对称**：负边缘（看空）同样被时间放大 —— 这是 SNR 的性质，不是对多空的态度。
+///
+/// 为什么放在判定侧而不是仓位侧：仓位只应承载可推导的量（σ、h、风险预算 R），
+/// 「长线更值得」是收益/概率命题，塞进仓位乘数就等于把偏好伪装成计算。
+///
+/// 退化：`anchor == 0` 或 `h == 0` ⇒ 原样返回 `p`（无从折算，不猜）。
+pub fn snr_confidence(p: f64, holding_days: usize, anchor_days: usize) -> f64 {
+    if holding_days == 0 || anchor_days == 0 || !p.is_finite() {
+        return p;
+    }
+    let scale = ((holding_days as f64) / (anchor_days as f64)).sqrt().min(SNR_SCALE_CAP);
+    let scaled = 0.5 + (p - 0.5) * scale;
+    scaled.clamp(0.0, 1.0)
+}
+
+/// 区间内**峰值到谷底**的最大回撤比例（0.0~1.0，恒非负）。
+///
+/// 为什么要新增这一份（B1 风险按档，2026-10-05）：逐档风险要算 2/5/28/90 四个窗口各自的
+/// 回撤，而本仓此前已有四份 peak-trough 实现
+/// （`astock-data/mcp_tools.rs` 的内联循环、`analysis-engine/risk.rs::peak_trough_drawdown`、
+/// `analysis-engine/serenity_hit_rate_backtest.rs::compute_max_drawdown_from_series`、
+/// `quant/metrics.rs::max_drawdown`）。若按窗口循环再写一份就是第五份 ⇒ 前两份现委托本函数
+/// （后两份入参形态不同：`EquityPoint` 序列 / 回测专用，登记为余项未并）。
+///
+/// 语义（逐条由测试锁定，且与所替换的两份既有实现**等价**）：
+/// - 峰值取**时间序上到当前为止**的最高价，回撤只统计峰值之后 ⇒ 无前视；
+/// - 非正 / 非有限价格跳过：既不作峰值种子，也不参与回撤（停牌、缺数据）；
+/// - 空序列或全非正 ⇒ `None`。调用方**不得当成 0 回撤** —— 把「算不出」读成「没回撤」
+///   会把缺席伪装成最低风险（与 [`realized_vol_pct`] 的「不得当成 0 波动」同一条纪律）。
+pub fn max_drawdown_fraction(prices: &[f64]) -> Option<f64> {
+    let mut peak = prices.iter().filter(|&&p| p.is_finite() && p > 0.0).copied().next()?;
+    let mut max_dd = 0.0_f64;
+    for &p in prices {
+        if !p.is_finite() || p <= 0.0 {
+            continue;
+        }
+        if p > peak {
+            peak = p;
+        }
+        let dd = (peak - p) / peak;
+        if dd > max_dd {
+            max_dd = dd;
+        }
+    }
+    Some(max_dd)
+}
+
+/// 平均秩（mid-rank）：并列值取其占据秩区间的均值，1-indexed。
+///
+/// 并列判据用 `|a−b| < 1e-9` 而非 `==` —— 与本仓既有实现（`hit_rate_backtest::rank_average`）
+/// 一致：因子分/置信度是计算得出的浮点，二进制相等但数学相等的值若不算并列，
+/// Spearman 的闭式解 `1 − 6Σd²/(n(n²−1))` 就不再成立。
+/// 输入含非有限值时按 `partial_cmp` 的 `Equal` 归入同组（调用方应先自行过滤）。
+pub fn average_ranks(values: &[f64]) -> Vec<f64> {
+    let n = values.len();
+    let mut indexed: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut ranks = vec![0.0; n];
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j < n && (indexed[j].1 - indexed[i].1).abs() < 1e-9 {
+            j += 1;
+        }
+        // i..j 是同一并列组（1-indexed 秩区间为 i+1..=j）
+        let avg = ((i + 1) + j) as f64 / 2.0;
+        for k in i..j {
+            ranks[indexed[k].0] = avg;
+        }
+        i = j;
+    }
+    ranks
+}
+
+/// Pearson 相关系数。
+///
+/// 返回 `None`（= 该量在此样本上**无定义**，不得当 0 用）：长度不等 / 不足 2 点 /
+/// 含非有限值 / 任一侧方差为 0。
+pub fn pearson(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    if xs.len() != ys.len() || xs.len() < 2 {
+        return None;
+    }
+    if xs.iter().chain(ys.iter()).any(|v| !v.is_finite()) {
+        return None;
+    }
+    let n = xs.len() as f64;
+    let mx = xs.iter().sum::<f64>() / n;
+    let my = ys.iter().sum::<f64>() / n;
+    let mut cov = 0.0;
+    let mut vx = 0.0;
+    let mut vy = 0.0;
+    for i in 0..xs.len() {
+        let dx = xs[i] - mx;
+        let dy = ys[i] - my;
+        cov += dx * dy;
+        vx += dx * dx;
+        vy += dy * dy;
+    }
+    let denom = (vx * vy).sqrt();
+    if denom < 1e-9 {
+        return None;
+    }
+    Some((cov / denom).clamp(-1.0, 1.0))
+}
+
+/// Spearman 秩相关（rank IC 的标准口径）= `pearson(rank(x), rank(y))`。
+///
+/// 为什么用秩不用 Pearson 原值：收益分布重尾，个别 −20%/+30% 的样本会把线性相关
+/// 整条拖走；IC 关心的是**排序是否正确**（预测强的样本是否真的收益更高），
+/// 秩相关对此天然稳健。
+///
+/// 返回 `None` 的情形与 [`pearson`] 同：秩无定义（样本 <2 / 含非有限 / 一侧无方差）。
+/// 「样本够不够多」是**调用方**的门槛（统计显著性取决于用途），不在这里替所有人定。
+pub fn spearman_rank_ic(pairs: &[(f64, f64)]) -> Option<f64> {
+    if pairs.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
+        return None;
+    }
+    let xs: Vec<f64> = pairs.iter().map(|p| p.0).collect();
+    let ys: Vec<f64> = pairs.iter().map(|p| p.1).collect();
+    pearson(&average_ranks(&xs), &average_ranks(&ys))
+}
+
+/// 个股在**同长窗口**内相对基准的累计超额收益（百分点，正=跑赢基准）。
+///
+/// 口径（阶段 1，`PLAN-mover-coverage-and-reflection-exit`）：
+/// `(个股末/个股初 − 1) − (基准末/基准初 − 1)`，两端用**同一批交易日**的收盘价。
+/// 之所以是「区间累计收益之差」而不是 beta 回归：`portfolio_monitor::compute_beta`
+/// 是组合风险监控用的 Cov/Var 回归（另一套窗口与用途），把它搬进决策链会让同一个
+/// 「相对强度」有两套不同分母的算法 —— 本仓为「两名目两套算法」付过多次代价。
+/// 这里只做**最朴素、可手算核对**的那一个量。
+///
+/// 窗口长度由**调用方**传入（逐档各用自己的持有期尺度，中线档就该拿中线的窗），
+/// 本函数不含任何常量 ⇒ 不构成第五套可调参数。
+///
+/// 返回 `None`（调用方按「该腿缺席」处理，**不得折成 0**）：
+/// 窗口不足 `lookback`、两序列长度不齐（错位一日就会把节假日差异读成 alpha）、
+/// 任一价格非正或非有限、首价非正（比值无定义）。
+/// 0 只留给「真的与基准同步」这个事实 —— 与 [`band_z`] 的 `σ≈0` 同一族处理。
+pub fn excess_return_pct(stock: &[f64], benchmark: &[f64], lookback: usize) -> Option<f64> {
+    if lookback < 2 || stock.len() != benchmark.len() || stock.len() < lookback {
+        return None;
+    }
+    let s = &stock[stock.len() - lookback..];
+    let b = &benchmark[benchmark.len() - lookback..];
+    if s.iter().chain(b.iter()).any(|v| !v.is_finite() || *v <= 0.0) {
+        return None;
+    }
+    let s_ret = s[s.len() - 1] / s[0] - 1.0;
+    let b_ret = b[b.len() - 1] / b[0] - 1.0;
+    let excess = (s_ret - b_ret) * 100.0;
+    excess.is_finite().then_some(excess)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── SMA ──
+
+    #[test]
+    fn sma_basic() {
+        assert_eq!(sma(&[1.0, 2.0, 3.0, 4.0], 2), Some(3.5));
+        assert_eq!(sma(&[1.0, 2.0, 3.0], 3), Some(2.0));
+    }
+
+    #[test]
+    fn sma_insufficient_data_returns_none() {
+        assert_eq!(sma(&[1.0, 2.0], 5), None);
+    }
+
+    #[test]
+    fn sma_zero_period_returns_none() {
+        assert_eq!(sma(&[1.0, 2.0, 3.0], 0), None);
+    }
+
+    #[test]
+    fn sma_empty_input_returns_none() {
+        assert_eq!(sma(&[], 1), None);
+    }
+
+    // ── EMA 序列 ──
+
+    #[test]
+    fn ema_series_basic() {
+        let series = build_ema_series(&[1.0, 2.0, 3.0, 4.0], 2);
+        assert_eq!(series.len(), 4);
+        // 首值 = SMA(1, 2) = 1.5
+        assert!((series[0] - 1.5).abs() < 1e-10);
+        // multiplier = 2/3, ema[1] = (2 - 1.5) * 2/3 + 1.5 = 1.8333...
+        assert!((series[1] - 1.8333_3333).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ema_series_empty_input() {
+        assert_eq!(build_ema_series(&[], 5), vec![0.0]);
+    }
+
+    #[test]
+    fn ema_series_zero_period() {
+        assert_eq!(build_ema_series(&[1.0, 2.0], 0), vec![0.0]);
+    }
+
+    #[test]
+    fn ema_last_matches_series_end() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let series = build_ema_series(&data, 3);
+        let last = ema_last(&data, 3);
+        assert!((last - series.last().copied().unwrap_or(0.0)).abs() < 1e-10);
+    }
+
+    // ── RSI ──
+
+    #[test]
+    fn rsi_all_up_is_100() {
+        // 持续上涨：avg_loss = 0 → RSI = 100
+        let closes = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        assert_eq!(rsi_wilder(&closes, 5), Some(100.0));
+    }
+
+    #[test]
+    fn rsi_all_down_is_0() {
+        // 持续下跌：avg_gain = 0, rs = 0 → RSI = 0
+        let closes = vec![6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        assert_eq!(rsi_wilder(&closes, 5), Some(0.0));
+    }
+
+    #[test]
+    fn rsi_insufficient_data_returns_none() {
+        assert_eq!(rsi_wilder(&[1.0, 2.0], 5), None);
+    }
+
+    #[test]
+    fn rsi_zero_period_returns_none() {
+        assert_eq!(rsi_wilder(&[1.0, 2.0, 3.0], 0), None);
+    }
+
+    #[test]
+    fn rsi_mixed_market_in_range() {
+        // 涨跌交替：RSI 应在 (0, 100) 之间
+        // 注意：Wilder 平滑用指数递归，对涨跌顺序敏感，不保证对称涨跌返回 50
+        let closes = vec![10.0, 11.0, 10.0, 11.0, 10.0, 11.0];
+        let rsi = rsi_wilder(&closes, 5).expect("数据充足应返回 Some");
+        assert!(rsi > 0.0 && rsi < 100.0, "RSI 应在 (0, 100) 区间, 实际: {}", rsi);
+    }
+
+    // ── 样本标准差 ──
+
+    #[test]
+    fn stddev_basic() {
+        let data = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+        let mean = data.iter().sum::<f64>() / data.len() as f64;
+        let sd = stddev_sample(&data, mean);
+        // 经典样本标准差 = 2.138...
+        assert!((sd - 2.138).abs() < 0.01, "sd = {}", sd);
+    }
+
+    #[test]
+    fn stddev_single_element_is_zero() {
+        assert_eq!(stddev_sample(&[5.0], 5.0), 0.0);
+    }
+
+    #[test]
+    fn stddev_empty_is_zero() {
+        assert_eq!(stddev_sample(&[], 0.0), 0.0);
+    }
+
+    #[test]
+    fn stddev_constant_series_is_zero() {
+        // 常数序列方差为 0
+        let data = vec![5.0, 5.0, 5.0, 5.0];
+        assert_eq!(stddev_sample(&data, 5.0), 0.0);
+    }
+
+    // ── Sharpe Ratio (P3-C8) ──
+
+    #[test]
+    fn sharpe_components_basic() {
+        // 正均值 → 正 sharpe
+        let returns = vec![0.01, 0.02, -0.01, 0.005, 0.015];
+        let r = sharpe_components(&returns, 0.0, 244.0);
+        assert!(r.sharpe > 0.0, "正均值应有正 sharpe, got {}", r.sharpe);
+        assert!(r.annualized > r.sharpe, "年化值应放大, sharpe={}, ann={}", r.sharpe, r.annualized);
+        assert!(r.mean_return > 0.0);
+        assert!(r.stddev > 0.0);
+    }
+
+    #[test]
+    fn sharpe_components_insufficient_data() {
+        let r = sharpe_components(&[0.01], 0.0, 244.0);
+        assert_eq!(r.sharpe, 0.0);
+        assert_eq!(r.annualized, 0.0);
+        assert_eq!(r.mean_return, 0.0);
+        assert_eq!(r.stddev, 0.0);
+    }
+
+    #[test]
+    fn sharpe_components_empty() {
+        let r = sharpe_components(&[], 0.0, 244.0);
+        assert_eq!(r.sharpe, 0.0);
+    }
+
+    #[test]
+    fn sharpe_components_constant_series_returns_zero_sharpe() {
+        // 常数序列 stddev=0 → sharpe=0，但 mean_return 保留
+        let r = sharpe_components(&[0.01, 0.01, 0.01], 0.0, 244.0);
+        assert_eq!(r.sharpe, 0.0);
+        assert_eq!(r.annualized, 0.0);
+        assert_eq!(r.stddev, 0.0);
+        assert!((r.mean_return - 0.01).abs() < 1e-10, "mean_return 应保留, got {}", r.mean_return);
+    }
+
+    #[test]
+    fn sharpe_components_uses_sample_variance() {
+        // 验证使用 n-1 而非 n 分母
+        // 数据: [1, 2, 3, 4, 5]
+        // mean = 3, Σ(x-mean)² = 4+1+0+1+4 = 10
+        // 样本方差 = 10/4 = 2.5 → stddev = √2.5 ≈ 1.5811
+        // 总体方差 = 10/5 = 2.0 → stddev = √2 ≈ 1.4142
+        let returns = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let r = sharpe_components(&returns, 0.0, 1.0);
+        let expected_stddev = (2.5_f64).sqrt();
+        assert!(
+            (r.stddev - expected_stddev).abs() < 1e-10,
+            "应使用样本方差 n-1, expected {}, got {}",
+            expected_stddev,
+            r.stddev
+        );
+    }
+
+    #[test]
+    fn sharpe_ratio_convenience_uses_a_share_default() {
+        // sharpe_ratio 应默认使用 244 天年化
+        let returns = vec![0.01, 0.02, -0.01, 0.005, 0.015];
+        let convenience = sharpe_ratio(&returns, 0.0);
+        let explicit =
+            sharpe_ratio_with_annualization(&returns, 0.0, A_SHARE_TRADING_DAYS_PER_YEAR);
+        assert!((convenience - explicit).abs() < 1e-10);
+    }
+
+    #[test]
+    fn sharpe_ratio_annual_converts_rf_correctly() {
+        // sharpe_ratio_annual(rf_annual=0.03, days=244) 应等价于
+        // sharpe_components(daily_rf=0.03/244, annualization=244).annualized
+        let returns = vec![0.01, 0.02, -0.01, 0.005, 0.015];
+        let annual = sharpe_ratio_annual(&returns, 0.03, 244.0);
+        let daily = sharpe_components(&returns, 0.03 / 244.0, 244.0).annualized;
+        assert!((annual - daily).abs() < 1e-12, "annual={}, daily={}", annual, daily);
+    }
+
+    #[test]
+    fn sharpe_ratio_annual_zero_days_returns_zero() {
+        let returns = vec![0.01, 0.02, -0.01];
+        assert_eq!(sharpe_ratio_annual(&returns, 0.03, 0.0), 0.0);
+    }
+
+    #[test]
+    fn sharpe_matches_astock_data_legacy_formula_after_fix() {
+        // 验证修复 astock-data 总体方差 bug 后的算法等价性:
+        // 修复前(bug): variance = Σ(x-mean)² / n
+        // 修复后(correct): variance = Σ(x-mean)² / (n-1) — 本 harness 实现
+        let returns = vec![0.01, 0.02, -0.01, 0.005, 0.015, 0.0, 0.012, -0.005];
+        let n = returns.len() as f64;
+        let mean = returns.iter().sum::<f64>() / n;
+        let variance_sample = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let variance_population = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
+        // 样本方差 > 总体方差（n-1 < n）， stddev 也更大 → Sharpe 绝对值更小
+        assert!(variance_sample > variance_population);
+        let r = sharpe_components(&returns, 0.0, 244.0);
+        assert!((r.stddev - variance_sample.sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn realized_vol_pct_matches_hand_computed_sample_stdev() {
+        // 收盘价 100 → 102 → 101 → 103：三条 return 已知，手算样本标准差
+        let closes = [100.0, 102.0, 101.0, 103.0];
+        let got = realized_vol_pct(&closes, 3).expect("应可计算");
+        let rets = [0.02, -1.0 / 102.0, 2.0 / 101.0];
+        let m = rets.iter().sum::<f64>() / 3.0;
+        let v = rets.iter().map(|r| (r - m).powi(2)).sum::<f64>() / 2.0;
+        assert!((got - v.sqrt() * 100.0).abs() < 1e-9, "实得 {got}");
+    }
+
+    #[test]
+    fn realized_vol_pct_refuses_insufficient_and_invalid_samples() {
+        // 样本不足 ⇒ None（不是 0.0 —— 0 波动会让止损宽度塌成 0）
+        assert!(realized_vol_pct(&[10.0, 10.1], 20).is_none());
+        assert!(realized_vol_pct(&[], 2).is_none());
+        // lookback < 2 无定义
+        assert!(realized_vol_pct(&[10.0, 11.0, 12.0], 1).is_none());
+        // 含非正价格 ⇒ 收益率无定义，不得静默跳过
+        assert!(realized_vol_pct(&[10.0, 0.0, 11.0, 12.0], 2).is_none());
+        assert!(realized_vol_pct(&[10.0, f64::NAN, 11.0, 12.0], 2).is_none());
+    }
+
+    #[test]
+    fn realized_vol_pct_uses_sample_not_population_variance() {
+        // 与总体方差口径可区分：n=3 个 return 时两者相差 √(3/2)
+        let closes = [100.0, 102.0, 99.0, 103.0];
+        let sample = realized_vol_pct(&closes, 3).expect("应可计算");
+        let rets = [0.02, -3.0 / 102.0, 4.0 / 99.0];
+        let m = rets.iter().sum::<f64>() / 3.0;
+        let pop = (rets.iter().map(|r| (r - m).powi(2)).sum::<f64>() / 3.0).sqrt() * 100.0;
+        assert!(
+            (sample - pop * (3.0_f64 / 2.0).sqrt()).abs() < 1e-9,
+            "σ 口径漂移：样本 {sample} vs 总体 {pop}"
+        );
+    }
+
+    /// √t 缩放：h=4 的位移应是 h=1 的两倍；h=0 与样本不足都拒绝出数。
+    #[test]
+    fn vol_move_pct_scales_by_sqrt_of_holding_days() {
+        let closes: Vec<f64> = (0..25).map(|i| 100.0 + (i % 5) as f64).collect();
+        let one = vol_move_pct(&closes, 20, 1).expect("h=1 应可计算");
+        let four = vol_move_pct(&closes, 20, 4).expect("h=4 应可计算");
+        let nine = vol_move_pct(&closes, 20, 9).expect("h=9 应可计算");
+        assert!((four - one * 2.0).abs() < 1e-9, "√4 应为 2 倍，实得 {four}/{one}");
+        assert!((nine - one * 3.0).abs() < 1e-9, "√9 应为 3 倍，实得 {nine}/{one}");
+        assert!(vol_move_pct(&closes, 20, 0).is_none(), "持有 0 天无定义");
+        assert!(vol_move_pct(&[100.0, 101.0], 20, 5).is_none(), "样本不足不得硬算");
+    }
+
+    /// SNR 折算：锚定档不改、短档收缩、长档放大，且对 0.5 两侧对称。
+    #[test]
+    fn snr_confidence_scales_edge_by_sqrt_of_horizon() {
+        assert!((snr_confidence(0.60, 28, 28) - 0.60).abs() < 1e-12, "锚定档不应改变");
+        let up7 = snr_confidence(0.60, 63, 28); // √(63/28)=1.5
+        assert!((up7 - 0.65).abs() < 1e-9, "长线应把 +0.10 边缘放大到 +0.15，实得 {up7}");
+        let down = snr_confidence(0.40, 63, 28);
+        assert!((down - 0.35).abs() < 1e-9, "看空必须对称放大，实得 {down}");
+        let short = snr_confidence(0.60, 7, 28); // √0.25=0.5
+        assert!((short - 0.55).abs() < 1e-9, "短线应收敛到 +0.05，实得 {short}");
+    }
+
+    #[test]
+    fn snr_confidence_clamps_and_degrades_without_guessing() {
+        assert_eq!(snr_confidence(0.99, 90, 28), 1.0, "放大后必须夹在 [0,1]");
+        assert_eq!(snr_confidence(0.01, 90, 28), 0.0);
+        assert_eq!(snr_confidence(0.62, 0, 28), 0.62, "h=0 无从折算 ⇒ 原样返回");
+        assert_eq!(snr_confidence(0.62, 90, 0), 0.62, "anchor=0 无从折算 ⇒ 原样返回");
+        assert!(snr_confidence(f64::NAN, 90, 28).is_nan(), "NaN 不得被夹成 0");
+    }
+
+    /// **根因 3 的回归测试**（2026-10-01 实证）：长档放大必须有上限。
+    ///
+    /// 无上限时 long 档（90 天 / 锚 28 天）拿到 `√(90/28) = 1.79×` ⇒ 弱看空被放大成
+    /// 极端看空；而趋势智选**结构性只在中/长档出票**（`style_matrix`：超短/短档
+    /// 带 `serenity_needs_week_or_longer_realization` 理由码）⇒ 两个子系统的时间偏好
+    /// 精确对冲。实测 300604 / 002371 四档恒为 观望/观望/减持/卖出。
+    #[test]
+    fn snr_confidence_caps_long_horizon_amplification() {
+        // 超出季度的部分被截断到 cap（而非 1.79×）
+        let long = snr_confidence(0.40, 90, 28);
+        let expected = 0.5 + (0.40 - 0.5) * SNR_SCALE_CAP;
+        assert!(
+            (long - expected).abs() < 1e-12,
+            "long 档放大必须截断到 {SNR_SCALE_CAP}，实得 {long}（期望 {expected}）"
+        );
+        // 未超上限的档位**逐位不变**（63 天恰好是 cap 的临界点 ⇒ 既有行为零回归）
+        assert!((snr_confidence(0.40, 63, 28) - 0.35).abs() < 1e-12);
+        assert!((snr_confidence(0.60, 63, 28) - 0.65).abs() < 1e-12);
+        // 「长线更值得」的**方向与单调性保留**：long 仍严格大于 mid，mid 仍严格大于 short
+        assert!(snr_confidence(0.60, 90, 28) > snr_confidence(0.60, 28, 28));
+        assert!(snr_confidence(0.60, 28, 28) > snr_confidence(0.60, 5, 28));
+        // 修复根因 1+2 后的真实形态（弱看空 heff ≈ 0.43）：long 档不得再跨过「观望」阈值 0.38。
+        // ⚠ 本断言正是 cap 的存在理由 —— 去掉 cap 时该值降到 0.3745（= 减持区间）。
+        let weak_bear = snr_confidence(0.43, 90, 28);
+        assert!(weak_bear >= 0.38, "弱看空(0.43)在 long 档不得跌入减持区间，实得 {weak_bear}");
+    }
+
+    /// 上限只作用于**放大**侧：短档的收缩（系数 < 1.0）不得被 cap 影响。
+    #[test]
+    fn snr_scale_cap_does_not_touch_shrinking_side() {
+        let short = snr_confidence(0.60, 7, 28); // √0.25 = 0.5
+        assert!((short - 0.55).abs() < 1e-12, "短档收缩系数必须仍是 0.5，实得 {short}");
+        assert!(snr_confidence(0.60, 1, 28) < 0.60, "h 极短时必须仍向 0.5 收缩");
+    }
+
+    // ── 秩相关（rank IC 的唯一实现，Phase E 收编三处重复）──
+
+    #[test]
+    fn average_ranks_uses_one_based_mid_ranks_with_epsilon_ties() {
+        // 精确并列与 1e-12 差值都要归入同组（沿用 hit_rate_backtest 的 ties 判据）
+        assert_eq!(average_ranks(&[10.0, 10.0, 30.0]), vec![1.5, 1.5, 3.0]);
+        // 1e-13 差值算并列 ⇒ 两者取 2、3 位的均值 2.5，最小者秩 1
+        assert_eq!(average_ranks(&[20.0, 20.0000000000001, 5.0]), vec![2.5, 2.5, 1.0]);
+        // 降序输入不影响秩分配（秩按值大小，不按位置）
+        assert_eq!(average_ranks(&[30.0, 20.0, 10.0]), vec![3.0, 2.0, 1.0]);
+        assert!(average_ranks(&[]).is_empty());
+    }
+
+    #[test]
+    fn pearson_none_when_undefined_never_fake_zero() {
+        assert!((pearson(&[1.0, 2.0, 3.0], &[2.0, 4.0, 6.0]).unwrap() - 1.0).abs() < 1e-12);
+        assert!((pearson(&[1.0, 2.0, 3.0], &[6.0, 4.0, 2.0]).unwrap() + 1.0).abs() < 1e-12);
+        // 长度不等 / 不足 2 点 / 一侧无方差 / 含非有限 ⇒ 全部 None
+        assert_eq!(pearson(&[1.0, 2.0], &[1.0, 2.0, 3.0]), None);
+        assert_eq!(pearson(&[1.0], &[1.0]), None);
+        assert_eq!(pearson(&[3.0, 3.0, 3.0], &[1.0, 2.0, 3.0]), None);
+        assert_eq!(pearson(&[f64::NAN, 2.0, 3.0], &[1.0, 2.0, 3.0]), None);
+    }
+
+    #[test]
+    fn spearman_is_order_only_and_pins_closed_form_for_ties() {
+        // 严格单调 ⇒ 1（与缩放量级无关）
+        let mono: Vec<(f64, f64)> = (0..9).map(|i| (i as f64, (i as f64).powi(3))).collect();
+        assert_eq!(spearman_rank_ic(&mono), Some(1.0));
+        // 有并列：x=[1,1,2,3] y=[1,2,3,4] ⇒ 闭式解 4.5/√22.5 = 0.9486833
+        let tied = vec![(1.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0)];
+        assert!((spearman_rank_ic(&tied).unwrap() - 0.948_683_3).abs() < 1e-6);
+        // 无定义 ⇒ None（不是 0）
+        assert_eq!(spearman_rank_ic(&[(0.5, 1.0), (0.5, 2.0), (0.5, 3.0)]), None);
+        assert_eq!(spearman_rank_ic(&[(0.5, f64::NAN)]), None);
+    }
+
+    #[test]
+    fn band_z_is_a_standardised_position_and_refuses_degenerate_windows() {
+        // [1,2,3,4,5]：mean=3、样本 σ=√2.5 ⇒ 末价 z = 2/√2.5 = 1.2649111
+        let up = [1.0, 2.0, 3.0, 4.0, 5.0];
+        assert!((band_z(&up, 5).unwrap() - 1.264_911_1).abs() < 1e-6);
+        // 带内对称：mean=3、**末价=3**（首版样本末价是 2，那是「低于均值」不是居中 ⇒ 假红）
+        // ⇒ 0（真居中，与「算不出」是两回事）
+        assert!((band_z(&[2.0, 4.0, 3.0, 1.0, 5.0, 3.0], 6).unwrap() - 0.0).abs() < 1e-12);
+        // 停盘 / 一字板：σ_价 = 0 ⇒ 位置无定义，返回 None 而不是 z=0
+        assert_eq!(band_z(&[10.0; 20], 20), None);
+        // 样本不足 / 含非正价格 / 含 NaN ⇒ 一律 None（调用方必须显式降级）
+        assert_eq!(band_z(&[1.0, 2.0], 5), None);
+        assert_eq!(band_z(&[1.0, 2.0, -3.0, 4.0], 4), None);
+        assert_eq!(band_z(&[1.0, 2.0, f64::NAN, 4.0], 4), None);
+        assert_eq!(band_z(&[1.0, 2.0, 3.0], 1), None, "lookback<2 时带宽无定义");
+    }
+
+    #[test]
+    fn max_drawdown_fraction_is_peak_to_trough_without_lookahead() {
+        // 10 → 8 → 12 → 9：两段候选回撤 2/10=0.20 与 3/12=0.25 ⇒ 取 0.25。
+        // 首版若把「窗口末价 vs 窗口首价」当回撤会算出 0.1 —— 那是另一个量（净涨跌）。
+        let got = max_drawdown_fraction(&[10.0, 8.0, 12.0, 9.0]).expect("应可计算");
+        assert!((got - 0.25).abs() < 1e-12, "实得 {got}");
+        // 单调上涨 ⇒ 0.0（真没回撤，与「算不出」是两回事）
+        assert_eq!(max_drawdown_fraction(&[1.0, 2.0, 3.0]).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn max_drawdown_fraction_refuses_empty_and_non_positive_samples() {
+        assert_eq!(max_drawdown_fraction(&[]), None);
+        assert_eq!(max_drawdown_fraction(&[0.0, -1.0]), None, "全非正 ⇒ 无定义，不得当成 0 回撤");
+        // 序列中间的非正价格跳过：不作峰值种子，也不参与回撤
+        assert!((max_drawdown_fraction(&[10.0, 0.0, 8.0]).unwrap() - 0.2).abs() < 1e-12);
+        assert!((max_drawdown_fraction(&[10.0, f64::NAN, 5.0]).unwrap() - 0.5).abs() < 1e-12);
+    }
+
+    // ── P0-5：recent_strength（超短档 breadth 门的个股前提）──
+
+    #[test]
+    fn recent_strength_counts_limit_ups_and_window_gain() {
+        // 10.0 起步：次日 +10% 封板（11.0），随后小阳整理，末日 11.5；窗口 5 日
+        let closes = [10.0, 11.0, 10.5, 10.8, 11.2, 11.5];
+        let s = recent_strength(&closes, 10.0, 5).expect("样本充足");
+        assert_eq!(s.limit_up_count, 1, "仅 10→11 那天封板");
+        assert_eq!(s.days, 5);
+        assert!((s.cum_gain_pct - 15.0).abs() < 1e-9, "11.5/10−1 = +15%，实得 {}", s.cum_gain_pct);
+    }
+
+    #[test]
+    fn recent_strength_limit_threshold_follows_board_limit_pct() {
+        // 同一组 +9.8% 大阳：10cm 板块算封板（≥9.5%），20cm 板块不算（需 ≥19%）
+        let closes = [10.0, 10.98, 11.0, 11.0, 11.0, 11.0];
+        assert_eq!(recent_strength(&closes, 10.0, 5).unwrap().limit_up_count, 1);
+        assert_eq!(recent_strength(&closes, 20.0, 5).unwrap().limit_up_count, 0);
+        // ST 5cm：+4.8% 算封板（阈值 4.75%），+4.6% 不算
+        let st_hit = [5.0, 5.24, 5.2, 5.2, 5.2, 5.2];
+        assert_eq!(recent_strength(&st_hit, 5.0, 5).unwrap().limit_up_count, 1);
+        let st_miss = [5.0, 5.23, 5.2, 5.2, 5.2, 5.2];
+        assert_eq!(recent_strength(&st_miss, 5.0, 5).unwrap().limit_up_count, 0);
+    }
+
+    #[test]
+    fn recent_strength_uses_only_last_lookback_window() {
+        // 窗口外（最早一日）的旧涨停不得计入
+        let closes = [10.0, 11.0, 11.2, 11.1, 11.0, 11.05];
+        let s = recent_strength(&closes, 10.0, 3).unwrap();
+        assert_eq!(s.days, 3, "只评估末 3 个交易日");
+        assert_eq!(s.limit_up_count, 0, "10→11 在窗口外");
+        // 累计涨幅以窗口起点 11.2 为基（lookback=3 个交易日 = 4 个收盘点；末 4 点 =
+        // [11.2, 11.1, 11.0, 11.05] —— 原注释写 11.1/原期望按 3 点算，与 days=3 的
+        // 期待自身互斥，2026-10-16 按实现逐值复核后订正）。
+        assert!((s.cum_gain_pct - (11.05 / 11.2 - 1.0) * 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn recent_strength_refuses_degenerate_inputs() {
+        assert_eq!(recent_strength(&[10.0], 10.0, 5), None, "单根无从算日涨幅");
+        assert_eq!(recent_strength(&[10.0, 11.0], 10.0, 0), None, "lookback=0 无定义");
+        assert_eq!(recent_strength(&[0.0, 11.0], 10.0, 5), None, "起点非正 ⇒ 累计涨幅无定义");
+        // 窗口内脏价：**含脏端点的配对整对跳过**（0 不是有效前收，涨幅无定义）——
+        // 两对 (10,0) 与 (0,11) 都含 0 ⇒ days=0。原期望 days=1 基于「只跳脏点本身」
+        // 的旧读法，与实现（任一端非正即跳过整对）矛盾，2026-10-16 按实现订正。
+        let s = recent_strength(&[10.0, 0.0, 11.0], 10.0, 5).unwrap();
+        assert_eq!(s.days, 0, "两对均含缺失点（前收为 0）⇒ 全部跳过");
+        assert_eq!(s.limit_up_count, 0, "0→11 不允许被当成涨停");
+    }
+
+    // ── surge_state（P1-4 追涨/阻力判据的客观量）──
+
+    #[test]
+    fn surge_state_gain_p90_and_prior_high() {
+        // 前 4 日成交额 1..4 亿，当日 10 亿（远超历史）= 放量；当日涨幅 +4.87%（紫金 10-09 实况量级）
+        let closes = [30.0, 29.8, 29.4, 29.37, 30.80];
+        let amounts = [1.0e8, 2.0e8, 3.0e8, 4.0e8, 1.0e9];
+        let highs = [30.5, 30.1, 29.9, 30.2, 31.0];
+        let s = surge_state(&closes, &amounts, &highs, 4).unwrap();
+        assert!((s.last_gain_pct - (30.80 / 29.37 - 1.0) * 100.0).abs() < 1e-9);
+        assert_eq!(s.last_amount, 1.0e9);
+        // nearest-rank ceil(0.9×4)=4 ⇒ 第 4 小 = 最大值 4e8（不含当日）
+        assert_eq!(s.amount_p90, Some(4.0e8));
+        assert!(s.last_amount > s.amount_p90.unwrap(), "当日放量判定基础成立");
+        // 前高不含当日：max(31.0) 不得计入
+        assert_eq!(s.prior_high, Some(30.5));
+        assert_eq!(s.high_ratio, Some(30.80 / 30.5));
+    }
+
+    #[test]
+    fn surge_state_excludes_current_bar_from_window() {
+        // 当日新高会让「距前高」恒 1.0 —— 前高必须取**当日之前**的窗口
+        let closes = [10.0, 10.5, 11.0];
+        let amounts = [1.0, 1.0, 1.0];
+        let highs = [10.0, 10.5, 99.0];
+        let s = surge_state(&closes, &amounts, &highs, 2).unwrap();
+        assert_eq!(s.prior_high, Some(10.5), "当日 99 的新高不得进前高");
+        assert!(s.high_ratio.unwrap() > 1.0, "相对前高的实时位置仍可 >1（突破）");
+    }
+
+    #[test]
+    fn surge_state_refuses_degenerate_inputs_and_short_windows() {
+        assert_eq!(surge_state(&[10.0], &[1.0], &[10.0], 5), None, "单根无从算涨幅");
+        assert_eq!(surge_state(&[0.0, 11.0], &[1.0, 1.0], &[1.0, 1.0], 5), None, "前收非正");
+        // 前窗口只有 1 根 ⇒ p90 无定义（None），但前高仍取得到
+        let s = surge_state(&[10.0, 11.0], &[1.0, 2.0], &[10.2, 11.1], 5).unwrap();
+        assert_eq!(s.amount_p90, None, "单样本分位无定义");
+        assert_eq!(s.prior_high, Some(10.2));
+        // 长度不齐取最短：amounts 多出的尾巴不得参与
+        let s2 = surge_state(&[10.0, 11.0], &[1.0, 2.0, 999.0], &[10.2, 11.1, 999.0], 5).unwrap();
+        assert_eq!(s2.last_amount, 2.0, "按最短长度对齐");
+    }
+
+    #[test]
+    fn surge_state_skips_dirty_values_in_window() {
+        let closes = [10.0, 10.2];
+        let amounts = [f64::NAN, 5.0]; // 窗口内 NaN 只跳过
+        let highs = [0.0, 10.3]; // ≤0 的脏高只跳过
+        let s = surge_state(&closes, &amounts, &highs, 5).unwrap();
+        assert_eq!(s.amount_p90, None, "脏值跳过后不足 2 根 ⇒ 分位 None");
+        assert_eq!(s.prior_high, None, "脏高跳过后无有效样本");
+    }
+
+    // ── excess_return_pct（阶段 1 逆势强度，2026-10-18）──
+    #[test]
+    fn excess_return_is_the_difference_of_window_returns() {
+        // 手算核对：个股 100→110 = +10%；基准 100→95 = −5%；超额 = +10 −(−5) = **+15**
+        let s = [100.0, 110.0];
+        let b = [100.0, 95.0];
+        let got = excess_return_pct(&s, &b, 2).expect("两根有效价格必须出数");
+        assert!((got - 15.0).abs() < 1e-9, "实得 {got}，期望 +15");
+        // 反向：跑输 ⇒ 负
+        assert!(excess_return_pct(&b, &s, 2).unwrap() < 0.0);
+    }
+
+    #[test]
+    fn synchronous_move_is_zero_not_absence() {
+        // 真·与基准同步 ⇒ Some(0)：0 在这里是事实，不是「拿不到」的伪装
+        let s = [10.0, 11.0, 12.1];
+        let b = [100.0, 110.0, 121.0];
+        assert_eq!(excess_return_pct(&s, &b, 3), Some(0.0));
+    }
+
+    #[test]
+    fn misaligned_or_dirty_windows_are_absence_not_zero() {
+        // 两序列长度不齐（差一日 = 节假日错位）⇒ 必须 None，不能截短硬算
+        assert_eq!(excess_return_pct(&[1.0, 2.0, 3.0], &[1.0, 2.0], 2), None);
+        // 窗口不足 lookback
+        assert_eq!(excess_return_pct(&[1.0, 2.0], &[1.0, 2.0], 5), None);
+        // lookback < 2 ⇒ 单根无「区间」可言
+        assert_eq!(excess_return_pct(&[1.0, 2.0], &[1.0, 2.0], 1), None);
+        // 非正值 / 非有限值 ⇒ None（首价 ≤0 时比值无定义）
+        assert_eq!(excess_return_pct(&[0.0, 2.0], &[1.0, 2.0], 2), None);
+        assert_eq!(excess_return_pct(&[1.0, f64::NAN], &[1.0, 2.0], 2), None);
+    }
+
+    #[test]
+    fn excess_return_on_the_real_2026_09_28_anchor_window_is_positive() {
+        // 真数据夹具（新浪日线收盘价，2026-10-18 取）：百洋股份 002696 vs 创业板指 399006，
+        // 锚点日 2026-09-28 收尾的 5 个交易日窗（09-21 / 09-22 / 09-23 / 09-24 / 09-28）。
+        // 期望值**按被测公式现算**（另用 Python 独立复核过，不是从取数脚本的截断输出手敲）：
+        //   个股  6.49 / 6.86 − 1 = −0.0539358601 → −5.3935860058%
+        //   基准 3139.825 / 3399.59 − 1 = −0.0764106848 → −7.6410684818%
+        //   超额 = −5.3935860058 − (−7.6410684818) = **+2.2474824760**（百分点）
+        // 这条断言锁的是「大盘暴跌日本股显著抗跌 ⇒ 该腿点亮且为正」——
+        // 002696 那轮归因里，锚点当天唯一可用却没人消费的正向证据就是这个量。
+        let stock = [6.86, 7.02, 6.59, 6.65, 6.49];
+        let bench = [3399.59, 3399.93, 3379.61, 3288.948, 3139.825];
+        let got = excess_return_pct(&stock, &bench, 5).expect("真实窗必须出数");
+        assert!(got > 0.0, "抗跌 ⇒ 超额必须为正，实得 {got}");
+        assert!((got - 2.2474824760).abs() < 1e-6, "实得 {got}，按公式现算期望 2.2474824760");
+    }
+}
