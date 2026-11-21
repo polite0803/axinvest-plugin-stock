@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Gateway 层访问 dao + crypto 的 trait 抽象。
+//!
+//! `PlatformAdapter` 是 facade trait，把 5 个子 trait 组合起来。
+//! gateway crate 不再直接依赖 axagent-dao / axagent-crypto，改为依赖本文件。
+
+use async_trait::async_trait;
+
+use crate::core_error::Result;
+use crate::types::{AppSettings, GatewayKey, ProviderConfig, ProviderKey};
+
+/// Chat completion parameters for platform bridge dispatches.
+pub struct ChatCompletionParams {
+    pub system_prompt: String,
+    pub message: String,
+    pub platform: String,
+    pub workflow_id: Option<String>,
+}
+
+// ── 1. ProviderRepository ──
+//
+// 唯一权威定义（`repositories.rs` 仅 re-export，不得再出现第二份同名定义）。
+// 方法集是原两处定义的并集：`report_key_failure` 来自 gateway 侧；`get_provider` /
+// `resolve_model_for_node` 原为 DI 侧必需方法，此处保留为带默认实现的兼容入口
+//（默认返回 NotFound，与原 platform 侧默认行为一致）。错误类型统一为 `AxAgentError`。
+
+#[async_trait]
+pub trait ProviderRepository: Send + Sync {
+    async fn list_providers(&self) -> Result<Vec<ProviderConfig>>;
+    async fn get_provider(&self, _id: &str) -> Result<ProviderConfig> {
+        Err(crate::core_error::AxAgentError::NotFound(
+            "get_provider not implemented".into(),
+        ))
+    }
+    async fn resolve_model_for_node(
+        &self,
+        _node_model: Option<&str>,
+        _session_model: Option<&str>,
+        _session_provider_id: Option<&str>,
+        _profile_suggested_provider: Option<&str>,
+    ) -> Result<(ProviderConfig, ProviderKey, String)> {
+        Err(crate::core_error::AxAgentError::NotFound(
+            "resolve_model_for_node not implemented".into(),
+        ))
+    }
+    async fn get_active_key(&self, provider_id: &str) -> Result<ProviderKey>;
+    /// Report a provider API key failure (e.g. 401/403/429)
+    /// so subsequent calls can failover to the next available key.
+    async fn report_key_failure(&self, _key_id: &str, _error_msg: &str) -> Result<()> {
+        // Default implementation: no-op (backwards compatible).
+        Ok(())
+    }
+}
+
+// ── 2. SettingsRepository ──
+//
+// 唯一权威定义（`repositories.rs` 仅 re-export）。方法集是原两处定义的并集：
+// `get_setting` / `set_setting` 原为 DI 侧必需方法，此处以默认实现保留（默认返回
+// NotFound，gateway 侧实现方无需覆盖）；`get_settings` 两侧均必需，保持必需。
+
+#[async_trait]
+pub trait SettingsRepository: Send + Sync {
+    /// 读取单个配置项。DI 侧实现方（`DaoSettingsRepository`）覆盖此方法；
+    /// gateway 侧实现方不覆盖时返回 NotFound。
+    async fn get_setting(&self, _key: &str) -> Result<Option<String>> {
+        Err(crate::core_error::AxAgentError::NotFound(
+            "get_setting not implemented by this repository".into(),
+        ))
+    }
+
+    /// 写入单个配置项。DI 侧实现方（`DaoSettingsRepository`）覆盖此方法；
+    /// gateway 侧实现方不覆盖时返回 NotFound。
+    async fn set_setting(&self, _key: &str, _value: &str) -> Result<()> {
+        Err(crate::core_error::AxAgentError::NotFound(
+            "set_setting not implemented by this repository".into(),
+        ))
+    }
+
+    async fn get_settings(&self) -> Result<AppSettings>;
+}
+
+// ── 3. GatewayKeyRepository ──
+
+#[async_trait]
+pub trait GatewayKeyRepository: Send + Sync {
+    async fn list_gateway_keys(&self) -> Result<Vec<GatewayKey>>;
+    async fn verify_key(&self, token: &str) -> Result<Option<GatewayKey>>;
+    /// Look up a key by its stable id. Returns `None` if not found.
+    /// SECURITY: callers must not assume the key is enabled — check `key.enabled`
+    /// before granting access.
+    async fn get_by_id(&self, key_id: &str) -> Result<Option<GatewayKey>>;
+    async fn update_last_used(&self, key_id: &str) -> Result<()>;
+    /// 将平台用户 ID 绑定到指定的 API Key（QR 扫码绑定用）。
+    async fn bind_platform_user(
+        &self,
+        _key_id: &str,
+        _platform: &str,
+        _platform_user_id: &str,
+    ) -> Result<()> {
+        Err(crate::core_error::AxAgentError::Internal(
+            "bind_platform_user not implemented by this repository".into(),
+        ))
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn record_usage(
+        &self,
+        key_id: &str,
+        provider_id: &str,
+        model_id: Option<&str>,
+        request_tokens: u64,
+        response_tokens: u64,
+        cached_input_tokens: u64,
+        // 本次请求估算的美元成本（由调用方基于 ModelPricing 换算后传入）。
+        // 未知定价时传 0.0，dao 层会原样落库。
+        cost_usd: f64,
+    ) -> Result<()>;
+
+    /// 聚合全量与今日的请求数、token 数、估算美元成本。
+    ///
+    /// 供 `/v1/usage` 端点暴露成本统计；dao 层通过单条 SQL 聚合，
+    /// 避免多次往返。今日边界用本地时区 0 点。
+    async fn get_metrics(&self) -> Result<crate::types::GatewayMetrics>;
+}
+
+// ── 4. GatewayRequestLogRepository ──
+
+#[async_trait]
+pub trait GatewayRequestLogRepository: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    async fn record_request_log(
+        &self,
+        key_id: &str,
+        key_name: &str,
+        method: &str,
+        path: &str,
+        model_id: Option<&str>,
+        provider_id: Option<&str>,
+        status_code: i32,
+        duration_ms: i64,
+        request_tokens: i64,
+        response_tokens: i64,
+        error_message: Option<&str>,
+    ) -> Result<()>;
+}
+
+// ── 5. CryptoService ──
+
+pub trait CryptoService: Send + Sync {
+    /// 使用内置 master_key 解密 base64 字符串，返回明文。
+    fn decrypt_key(&self, encrypted: &str) -> Result<String>;
+    /// 使用内置 master_key 加密明文，返回 base64 密文。
+    fn encrypt_key(&self, plaintext: &str) -> Result<String>;
+    /// 使用显式密钥解密。
+    fn decrypt_key_with(&self, encrypted: &str, master_key: &[u8; 32]) -> Result<String>;
+    /// 使用显式密钥加密。
+    fn encrypt_key_with(&self, plaintext: &str, master_key: &[u8; 32]) -> Result<String>;
+    /// HMAC-SHA256，返回十六进制字符串。key 为原始字节。
+    fn hmac_sha256(&self, key: &[u8], msg: &str) -> String;
+    /// SHA-256 哈希，返回十六进制字符串。
+    fn sha256_hash(&self, input: &str) -> String;
+    /// 从 key 中提取可识别前缀（仅用于 UI 展示）。
+    fn key_prefix(&self, key: &str) -> String;
+    /// 生成新的 gateway API key。
+    fn generate_gateway_key(&self) -> String;
+    /// 生成随机 32 字节 master key。
+    fn generate_master_key(&self) -> [u8; 32];
+    /// 使用机器指纹派生密钥加密备份数据。
+    fn encrypt_backup_key(&self, key_data: &[u8]) -> Result<Vec<u8>>;
+    /// 解密备份数据。
+    fn decrypt_backup_key(&self, enc_data: &[u8]) -> Result<Vec<u8>>;
+}
+
+// ── PlatformAdapter（facade trait） ──
+
+/// 把上面 5 个子 trait 聚合成一个入口，wiring 层注入一次，gateway 内部通过
+/// `state.adapter.providers().xxx()` 链式调用。
+#[async_trait]
+pub trait PlatformAdapter: Send + Sync {
+    fn providers(&self) -> &dyn ProviderRepository;
+    fn settings(&self) -> &dyn SettingsRepository;
+    fn gateway_keys(&self) -> &dyn GatewayKeyRepository;
+    fn request_log(&self) -> &dyn GatewayRequestLogRepository;
+    fn crypto(&self) -> &dyn CryptoService;
+
+    /// Dispatch a chat completion request via the configured provider.
+    /// Used by the platform bridge webhook handler to respond to incoming messages.
+    async fn chat_completion(&self, params: ChatCompletionParams) -> Result<String> {
+        let _ = params;
+        Err(crate::core_error::AxAgentError::Internal(
+            "chat_completion not implemented by this adapter".into(),
+        ))
+    }
+}
