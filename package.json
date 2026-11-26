@@ -2,6 +2,7 @@
   "name": "plugin-stock-repo",
   "private": true,
   "devDependencies": {
+    "esbuild": "^0.28.2",
     "jsdom": "^30.0.1"
   }
 }

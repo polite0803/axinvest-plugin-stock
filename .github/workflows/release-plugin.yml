@@ -81,6 +81,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          npm run build:web --prefix plugin-stock
           artifact_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${PLUGIN_NAME}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
           node scripts/build-plugin-bundle.mjs --plugin "${PLUGIN_NAME}" --plugin-version "${RELEASE_TAG#v}" --release --target "${{ matrix.target }}" --check --out "dist/plugins/${PLUGIN_NAME}"
           node - <<'NODE'

@@ -216,6 +216,9 @@ const COMMAND_QUANT_METRICS_COMPARE: &str = "stock_quant_metrics_compare";
 const COMMAND_QUANT_STRATEGY_REGISTER_RHAI: &str = "stock_quant_strategy_register_rhai";
 /// 手动设置 vendor 健康状态（宿主 `set_vendor_status`，#337）—— 写语义 op。
 const COMMAND_SET_VENDOR_STATUS: &str = "stock_set_vendor_status";
+/// 设置主行情源 —— 原宿主命令 `stock_set_market_data_primary_vendor` 的业务体下沉为
+/// `stock.analysis` 写 op；写 settings + 即时重排 `quote`/`klines` 链首。
+const COMMAND_SET_MARKET_DATA_PRIMARY_VENDOR: &str = "stock_set_market_data_primary_vendor";
 /// 取消进行中的分析任务（宿主 `cancel_stock_analysis`，#337）—— 写语义 op。
 const COMMAND_CANCEL_STOCK_ANALYSIS: &str = "stock_cancel_stock_analysis";
 /// 漏检补分析批次状态（宿主 `get_mover_recall_analysis_batch`，#338）—— 读 op。
@@ -325,6 +328,48 @@ const COMMAND_GET_T0_CONFIG: &str = "stock_get_t0_config";
 const COMMAND_SET_T0_CONFIG: &str = "stock_set_t0_config";
 /// 组合监控仪表盘（宿主 `get_portfolio_dashboard`，#344）—— 读 op。
 const COMMAND_GET_PORTFOLIO_DASHBOARD: &str = "stock_get_portfolio_dashboard";
+// ── G2 模拟组合九条：宿主 `paper_portfolio_*` Tauri 命令退役后的插件命令面 ──────
+// 命令名保持原样（前端 store 只换调用入口，不改命令名）；业务体经 `stock.analysis`
+// 同名 op 落到宿主 provider，插件侧不重写任何组合/持仓算法（禁区 12）。
+/// 创建模拟组合 —— 写 op。
+const COMMAND_PAPER_PORTFOLIO_CREATE: &str = "paper_portfolio_create";
+/// 列出组合（可按 status 过滤）—— 读 op。
+const COMMAND_PAPER_PORTFOLIO_LIST: &str = "paper_portfolio_list";
+/// 组合详情（含持仓 + 实时盈亏）—— 读 op。
+const COMMAND_PAPER_PORTFOLIO_GET: &str = "paper_portfolio_get";
+/// 关闭组合 —— 写 op。
+const COMMAND_PAPER_PORTFOLIO_CLOSE: &str = "paper_portfolio_close";
+/// 归档组合 —— 写 op。
+const COMMAND_PAPER_PORTFOLIO_ARCHIVE: &str = "paper_portfolio_archive";
+/// 添加虚拟持仓 —— 写 op。
+const COMMAND_PAPER_PORTFOLIO_ADD_POSITION: &str = "paper_portfolio_add_position";
+/// 平仓单只持仓 —— 写 op。
+const COMMAND_PAPER_PORTFOLIO_CLOSE_POSITION: &str = "paper_portfolio_close_position";
+/// 批量平仓 —— 写 op。
+const COMMAND_PAPER_PORTFOLIO_CLOSE_ALL_POSITIONS: &str = "paper_portfolio_close_all_positions";
+/// active 组合详情（Dashboard）—— 读 op。
+const COMMAND_PAPER_PORTFOLIO_LIST_ACTIVE_DETAILS: &str = "paper_portfolio_list_active_details";
+// ── G6 截图诊断八条：宿主 `screenshot_diagnosis_*` Tauri 命令退役后的插件命令面 ──────
+// 命令名保持原样（前端 store 只换调用入口）；业务体经 `stock.analysis` 同名 op 落到宿主
+// provider，插件侧不复制 VLM / LLM / 风险诊断算法（禁区 12）。
+/// 截图上传自动诊断（base64 经插件帧透传，单帧上限 64 MB）—— 写 op。
+const COMMAND_SCREENSHOT_DIAGNOSIS_CREATE_FROM_IMAGE: &str =
+    "screenshot_diagnosis_create_from_image";
+/// 直接传 positions 创建诊断 —— 写 op。
+const COMMAND_SCREENSHOT_DIAGNOSIS_CREATE: &str = "screenshot_diagnosis_create";
+/// 按 ID 获取诊断 —— 读 op。
+const COMMAND_SCREENSHOT_DIAGNOSIS_GET: &str = "screenshot_diagnosis_get";
+/// 最近 N 条诊断 —— 读 op。
+const COMMAND_SCREENSHOT_DIAGNOSIS_LIST_RECENT: &str = "screenshot_diagnosis_list_recent";
+/// 按状态过滤诊断 —— 读 op。
+const COMMAND_SCREENSHOT_DIAGNOSIS_LIST_BY_STATUS: &str = "screenshot_diagnosis_list_by_status";
+/// 归档诊断 —— 写 op。
+const COMMAND_SCREENSHOT_DIAGNOSIS_ARCHIVE: &str = "screenshot_diagnosis_archive";
+/// 更新诊断字段 —— 写 op。
+const COMMAND_SCREENSHOT_DIAGNOSIS_UPDATE: &str = "screenshot_diagnosis_update";
+/// 诊断一键转模拟组合 —— 写 op。
+const COMMAND_SCREENSHOT_DIAGNOSIS_TO_PAPER_PORTFOLIO: &str =
+    "screenshot_diagnosis_to_paper_portfolio";
 /// 刷新组合监控快照（写 portfolio_metrics_daily + correlation_snapshot）（宿主 `refresh_portfolio_metrics`，#344）—— 写 op。
 const COMMAND_REFRESH_PORTFOLIO_METRICS: &str = "stock_refresh_portfolio_metrics";
 /// 开仓限制校验（宿主 `check_position_limits`，#344）—— 读 op。
@@ -927,6 +972,17 @@ fn handle_command(
             peer,
             &request.call_chain,
             "set_vendor_status",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_SET_MARKET_DATA_PRIMARY_VENDOR => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "set_primary_market_vendor",
             stock_analysis_request(&frame.input),
         ) {
             Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
@@ -1675,6 +1731,194 @@ fn handle_command(
             peer,
             &request.call_chain,
             "get_portfolio_dashboard",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        // G2 模拟组合九条：入参原样透传（camelCase），字段形状权威在宿主 DTO。
+        COMMAND_PAPER_PORTFOLIO_CREATE => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "paper_portfolio_create",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_PAPER_PORTFOLIO_LIST => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "paper_portfolio_list",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_PAPER_PORTFOLIO_GET => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "paper_portfolio_get",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_PAPER_PORTFOLIO_CLOSE => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "paper_portfolio_close",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_PAPER_PORTFOLIO_ARCHIVE => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "paper_portfolio_archive",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_PAPER_PORTFOLIO_ADD_POSITION => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "paper_portfolio_add_position",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_PAPER_PORTFOLIO_CLOSE_POSITION => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "paper_portfolio_close_position",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_PAPER_PORTFOLIO_CLOSE_ALL_POSITIONS => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "paper_portfolio_close_all_positions",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_PAPER_PORTFOLIO_LIST_ACTIVE_DETAILS => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "paper_portfolio_list_active_details",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_SCREENSHOT_DIAGNOSIS_CREATE_FROM_IMAGE => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "screenshot_diagnosis_create_from_image",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_SCREENSHOT_DIAGNOSIS_CREATE => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "screenshot_diagnosis_create",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_SCREENSHOT_DIAGNOSIS_GET => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "screenshot_diagnosis_get",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_SCREENSHOT_DIAGNOSIS_LIST_RECENT => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "screenshot_diagnosis_list_recent",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_SCREENSHOT_DIAGNOSIS_LIST_BY_STATUS => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "screenshot_diagnosis_list_by_status",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_SCREENSHOT_DIAGNOSIS_ARCHIVE => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "screenshot_diagnosis_archive",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_SCREENSHOT_DIAGNOSIS_UPDATE => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "screenshot_diagnosis_update",
+            stock_analysis_request(&frame.input),
+        ) {
+            Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
+            Err((code, message)) => {
+                CommandOutcome::Fault(CommandFault::for_frame(&frame, code, message))
+            }
+        },
+        COMMAND_SCREENSHOT_DIAGNOSIS_TO_PAPER_PORTFOLIO => match call_analysis_seam(
+            peer,
+            &request.call_chain,
+            "screenshot_diagnosis_to_paper_portfolio",
             stock_analysis_request(&frame.input),
         ) {
             Ok(value) => CommandOutcome::Reply(CommandReply::for_frame(&frame, value)),
@@ -5478,8 +5722,9 @@ mod tests {
             super::COMMAND_QUANT_STRATEGIES_LIST,
             super::COMMAND_QUANT_METRICS_COMPARE,
             super::COMMAND_QUANT_STRATEGY_REGISTER_RHAI,
-            // #337 两条：vendor 状态 / 取消令牌（写语义，均走 stock.analysis）。
+            // #337 三条：vendor 状态 / 主源设置 / 取消令牌（写语义，均走 stock.analysis）。
             super::COMMAND_SET_VENDOR_STATUS,
+            super::COMMAND_SET_MARKET_DATA_PRIMARY_VENDOR,
             super::COMMAND_CANCEL_STOCK_ANALYSIS,
             // #338 三条：mover_recall_analysis 两读一写（均走 stock.analysis）。
             super::COMMAND_MOVER_RECALL_BATCH,
@@ -5536,6 +5781,25 @@ mod tests {
             super::COMMAND_GET_T0_CONFIG,
             super::COMMAND_SET_T0_CONFIG,
             super::COMMAND_GET_PORTFOLIO_DASHBOARD,
+            // G2 模拟组合九条：全部走 `stock.analysis` 显式臂，不进三张路由表。
+            super::COMMAND_PAPER_PORTFOLIO_CREATE,
+            super::COMMAND_PAPER_PORTFOLIO_LIST,
+            super::COMMAND_PAPER_PORTFOLIO_GET,
+            super::COMMAND_PAPER_PORTFOLIO_CLOSE,
+            super::COMMAND_PAPER_PORTFOLIO_ARCHIVE,
+            super::COMMAND_PAPER_PORTFOLIO_ADD_POSITION,
+            super::COMMAND_PAPER_PORTFOLIO_CLOSE_POSITION,
+            super::COMMAND_PAPER_PORTFOLIO_CLOSE_ALL_POSITIONS,
+            super::COMMAND_PAPER_PORTFOLIO_LIST_ACTIVE_DETAILS,
+            // G6 截图诊断八条：全部走 `stock.analysis` 显式臂，不进行情/K线/cron 路由表。
+            super::COMMAND_SCREENSHOT_DIAGNOSIS_CREATE_FROM_IMAGE,
+            super::COMMAND_SCREENSHOT_DIAGNOSIS_CREATE,
+            super::COMMAND_SCREENSHOT_DIAGNOSIS_GET,
+            super::COMMAND_SCREENSHOT_DIAGNOSIS_LIST_RECENT,
+            super::COMMAND_SCREENSHOT_DIAGNOSIS_LIST_BY_STATUS,
+            super::COMMAND_SCREENSHOT_DIAGNOSIS_ARCHIVE,
+            super::COMMAND_SCREENSHOT_DIAGNOSIS_UPDATE,
+            super::COMMAND_SCREENSHOT_DIAGNOSIS_TO_PAPER_PORTFOLIO,
             super::COMMAND_REFRESH_PORTFOLIO_METRICS,
             super::COMMAND_CHECK_POSITION_LIMITS,
             super::COMMAND_APPROVE_EVOLUTION_PLAN,

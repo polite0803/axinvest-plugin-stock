@@ -1,6 +1,7 @@
 <!doctype html>
 <!--
-  股票插件的 bundle 页面（B2 垂直切片）。
+  股票插件的 bundle 页面（T3 垂直切片：数据切片 / 跨市场 / 模拟观察 / 量化 / 智能选股 /
+  模拟组合账本 / 截图诊断）。
 
   本页只装载构建产物 `bundle.js`：真正的桥客户端以 TS 源码 vendored 在插件仓
   （vendor/sdk/ 三件套），由 esbuild 连同页面入口 src-web/main.ts 一起打成单文件 iife。
@@ -17,9 +18,76 @@
   <head>
     <meta charset="utf-8" />
     <title>股票插件</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --stock-border: #d9d9d9;
+        --stock-muted: #666;
+        --stock-error: #c0392b;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --stock-border: #444;
+          --stock-muted: #aaa;
+          --stock-error: #ff7875;
+        }
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        font: 13px/1.6 system-ui, sans-serif;
+        color: inherit;
+      }
+      .stock-header h1 { margin: 0 0 8px; font-size: 16px; }
+      .stock-tabs { display: flex; gap: 8px; margin: 0 0 12px; border-bottom: 1px solid var(--stock-border); }
+      .stock-tabs button {
+        appearance: none;
+        border: 0;
+        border-bottom: 2px solid transparent;
+        background: none;
+        color: inherit;
+        cursor: pointer;
+        font: inherit;
+        padding: 6px 12px;
+      }
+      .stock-tabs button[aria-selected="true"] { border-bottom-color: currentColor; font-weight: 600; }
+      .stock-view[hidden] { display: none; }
+      .x-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; margin: 0 0 12px; }
+      .x-form label { display: flex; flex-direction: column; gap: 2px; color: var(--stock-muted); }
+      .x-form input { font: inherit; padding: 3px 6px; }
+      .x-form button { font: inherit; padding: 4px 12px; cursor: pointer; }
+      .x-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+      .x-section { border: 1px solid var(--stock-border); border-radius: 6px; padding: 8px 10px; }
+      .x-section h3 { margin: 0 0 6px; font-size: 13px; }
+      .x-empty { color: var(--stock-muted); margin: 0; }
+      .x-error { color: var(--stock-error); margin: 0; }
+      .x-kv > div { display: flex; justify-content: space-between; gap: 8px; }
+      .x-kv span { color: var(--stock-muted); }
+      .x-chart { display: block; width: 100%; height: auto; }
+      .x-range { margin: 4px 0 0; color: var(--stock-muted); font-size: 12px; }
+      .p-content { display: grid; gap: 12px; }
+      .p-summary { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+      .p-card { display: flex; flex-direction: column; gap: 2px; border: 1px solid var(--stock-border); border-radius: 6px; padding: 8px 10px; }
+      .p-card span { color: var(--stock-muted); font-size: 12px; }
+      .p-card strong { font-size: 15px; }
+      .p-table-wrap { overflow-x: auto; }
+      .p-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+      .p-table th, .p-table td { border-bottom: 1px solid var(--stock-border); padding: 4px 8px; text-align: right; white-space: nowrap; }
+      .p-table th:first-child, .p-table td:first-child,
+      .p-table th:nth-child(2), .p-table td:nth-child(2) { text-align: left; }
+      .p-sectors { display: grid; gap: 4px; }
+      .p-sector { display: grid; grid-template-columns: 110px 1fr 60px; gap: 8px; align-items: center; }
+      .p-sector-bar { display: block; height: 8px; background: var(--stock-border); border-radius: 4px; }
+      .p-sector-bar > span { display: block; height: 8px; background: currentColor; border-radius: 4px; }
+      .p-sector span:last-child { text-align: right; color: var(--stock-muted); }
+      .p-stress { display: grid; gap: 4px; color: var(--stock-muted); }
+      .x-json { margin: 0; white-space: pre-wrap; word-break: break-all; font: 12px/1.5 ui-monospace, monospace; }
+      .l-row, .d-row { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 6px 0; border-bottom: 1px solid var(--stock-border); }
+      .l-detail, .d-detail { display: grid; gap: 8px; }
+      .d-detail pre { margin: 0; white-space: pre-wrap; font: 12px/1.5 ui-monospace, monospace; }
+    </style>
   </head>
-  <body style="margin:0;padding:16px;font:13px/1.6 system-ui,sans-serif;color:inherit">
-    <h1 style="margin:0 0 8px;font-size:16px">股票插件 · 数据切片</h1>
+  <body>
     <div id="root"></div>
     <script src="./bundle.js"></script>
   </body>

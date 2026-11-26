@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// 股票插件 bundle 页面入口（B2 垂直切片）。
+// 股票插件 bundle 页面入口（T3 垂直切片：数据切片 / 跨市场 / 模拟观察 / 量化 / 智能选股）。
 //
 // 协议帧 / 命令白名单 / ready / dispose 全部来自 vendored 桥（../vendor/sdk/），
-// 本文件只做两件事：把十条 stock_* 命令经桥投递给宿主、把回执渲染成 DOM。
+// 本文件只做两件事：把 stock_* 命令经桥投递给宿主、把回执渲染成 DOM。
 // 任何协议帧字面量都不得在这里重写（那会成为协议的第二份副本）。
 //
 // ⚠ 通道口径：vendored 白名单只有 `plugin_ui_action` / `plugin_execute_command` 两条
-// （vendor/sdk/pluginBridgeProtocol.ts），所以十条 stock_* 命令必须走
+// （vendor/sdk/pluginBridgeProtocol.ts），所以所有 stock_* 命令必须走
 // `client.executeCommand({ name, input })`，由宿主的 plugin_execute_command 再按 name
 // 分发到插件 worker 的 COMMAND_* 臂。绝不能 `client.invoke("stock_*")`——那会在
 // client 侧白名单被拒且一帧不发（vendor/sdk/pluginClientBridge.ts 的 invoke 实现）。
@@ -19,8 +19,21 @@
 //
 // 宿主约束（PluginPageHost）：bundle 入口必须顶层创建客户端 + 顶层 announceReady()，
 // 否则容器停在 loading 直到 skill.timeoutError 白屏；卸载必须 dispose()。
+//
+// T3 切片边界：八个 Tab 共用同一个桥客户端；ready 只发一帧，dispose 只调一次。
+// 数据切片（原 B2 十条命令）默认激活；跨市场（四条只读行情）、模拟观察（一条组合看板）、
+// 量化（三条只读命令）、智能选股（六条读数 + 一条级联决策摘要）、模拟组合账本
+// （paper_portfolio_*）、截图诊断（screenshot_diagnosis_*）、工作区（六视图数据面）
+// 首次点开才装载，切走只隐藏 DOM 不卸载，避免重复发帧。
 
 import { createAxAgentPluginClient } from "../vendor/sdk/pluginClientBridge";
+import { mountCrossMarket } from "./crossMarket";
+import { mountPaperLedger } from "./paperLedger";
+import { mountPortfolio } from "./portfolio";
+import { mountQuant } from "./quant";
+import { mountScreener } from "./screener";
+import { mountScreenshotDiagnosis } from "./screenshotDiagnosis";
+import { mountWorkspace } from "./workspace";
 
 // 顶层求值即创建 + 就绪：不塞进 DOMContentLoaded 回调里延迟。
 const client = createAxAgentPluginClient();
@@ -194,8 +207,8 @@ async function invokeOne(call: StockCall): Promise<Outcome> {
   }
 }
 
-/** 渲染单条命令的结局到 root：回执 / 空态 / 失败 / 未发调用，四态分列。 */
-function renderSection(root: HTMLElement, name: string, outcome: Outcome): void {
+/** 渲染单条命令的结局到 host：回执 / 空态 / 失败 / 未发调用，四态分列。 */
+function renderSection(host: HTMLElement, name: string, outcome: Outcome): void {
   const section = document.createElement("section");
   section.style.cssText = "margin:0 0 12px;padding:8px 10px;border:1px solid #ddd;border-radius:6px";
 
@@ -216,35 +229,158 @@ function renderSection(root: HTMLElement, name: string, outcome: Outcome): void 
   }
   section.appendChild(pre);
 
-  root.appendChild(section);
+  host.appendChild(section);
 }
 
-/** 页面主流程：第一轮七条独立命令 → 级联三条（参数来自第一轮回执，缺参显式跳过）。 */
-async function main(): Promise<void> {
-  const root = document.getElementById("root");
-  if (!root) {
-    return;
-  }
-
+/** 数据切片主流程：第一轮七条独立命令 → 级联三条（参数来自第一轮回执，缺参显式跳过）。 */
+async function main(host: HTMLElement): Promise<void> {
   const firstRound = new Map<string, unknown>();
   for (const call of BASE_CALLS) {
     const outcome = await invokeOne(call);
     if (outcome.kind === "receipt") {
       firstRound.set(call.name, outcome.raw);
     }
-    renderSection(root, call.name, outcome);
+    renderSection(host, call.name, outcome);
   }
 
   for (const dep of resolveDependentCalls(firstRound)) {
     const outcome: Outcome = dep.skip === null
       ? await invokeOne(dep.call)
       : { kind: "skipped", reason: dep.skip };
-    renderSection(root, dep.call.name, outcome);
+    renderSection(host, dep.call.name, outcome);
   }
 }
 
-// 顶层触发渲染（main 内部每条命令各自兜底，整体不会被单条失败打断）。
-void main();
+/** 内部 Tab 壳：两个视图共用桥客户端；只创建一帧 ready，卸载时一次 dispose。 */
+function mountShell(root: HTMLElement): () => void {
+  const header = document.createElement("header");
+  header.className = "stock-header";
+  const title = document.createElement("h1");
+  title.textContent = "股票插件 · 数据切片";
+  header.appendChild(title);
+
+  const nav = document.createElement("nav");
+  nav.className = "stock-tabs";
+  const dataHost = document.createElement("div");
+  dataHost.className = "stock-view";
+  const crossHost = document.createElement("div");
+  crossHost.className = "stock-view";
+  crossHost.hidden = true;
+  const portfolioHost = document.createElement("div");
+  portfolioHost.className = "stock-view";
+  portfolioHost.hidden = true;
+  const quantHost = document.createElement("div");
+  quantHost.className = "stock-view";
+  quantHost.hidden = true;
+  const screenerHost = document.createElement("div");
+  screenerHost.className = "stock-view";
+  screenerHost.hidden = true;
+  const ledgerHost = document.createElement("div");
+  ledgerHost.className = "stock-view";
+  ledgerHost.hidden = true;
+  const diagnosisHost = document.createElement("div");
+  diagnosisHost.className = "stock-view";
+  diagnosisHost.hidden = true;
+  const workspaceHost = document.createElement("div");
+  workspaceHost.className = "stock-view";
+  workspaceHost.hidden = true;
+
+  const tabs = [
+    { id: "data", label: "数据切片", host: dataHost },
+    { id: "cross-market", label: "跨市场行情", host: crossHost },
+    { id: "portfolio", label: "模拟观察", host: portfolioHost },
+    { id: "quant", label: "量化实验", host: quantHost },
+    { id: "screener", label: "智能选股", host: screenerHost },
+    { id: "paper-ledger", label: "模拟组合账本", host: ledgerHost },
+    { id: "screenshot-diagnosis", label: "截图诊断", host: diagnosisHost },
+    { id: "workspace", label: "股票工作区", host: workspaceHost },
+  ] as const;
+  const buttons = new Map<string, HTMLButtonElement>();
+  let active = "data";
+  let crossCleanup: (() => void) | null = null;
+  let portfolioCleanup: (() => void) | null = null;
+  let quantCleanup: (() => void) | null = null;
+  let screenerCleanup: (() => void) | null = null;
+  let ledgerCleanup: (() => void) | null = null;
+  let diagnosisCleanup: (() => void) | null = null;
+  let workspaceCleanup: (() => void) | null = null;
+
+  function activate(id: string): void {
+    active = id;
+    for (const tab of tabs) {
+      const button = buttons.get(tab.id);
+      if (button) {
+        button.setAttribute("aria-selected", String(tab.id === id));
+      }
+      tab.host.hidden = tab.id !== id;
+    }
+    // 首次点开才装载：命令此时才发，默认数据切片帧序不受影响。
+    if (id === "cross-market" && crossCleanup === null) {
+      crossCleanup = mountCrossMarket(crossHost, client);
+    }
+    if (id === "portfolio" && portfolioCleanup === null) {
+      portfolioCleanup = mountPortfolio(portfolioHost, client);
+    }
+    if (id === "quant" && quantCleanup === null) {
+      quantCleanup = mountQuant(quantHost, client);
+    }
+    if (id === "screener" && screenerCleanup === null) {
+      screenerCleanup = mountScreener(screenerHost, client);
+    }
+    if (id === "paper-ledger" && ledgerCleanup === null) {
+      ledgerCleanup = mountPaperLedger(ledgerHost, client);
+    }
+    if (id === "screenshot-diagnosis" && diagnosisCleanup === null) {
+      diagnosisCleanup = mountScreenshotDiagnosis(diagnosisHost, client);
+    }
+    if (id === "workspace" && workspaceCleanup === null) {
+      workspaceCleanup = mountWorkspace(workspaceHost, client);
+    }
+  }
+
+  for (const tab of tabs) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = tab.label;
+    button.addEventListener("click", () => activate(tab.id));
+    buttons.set(tab.id, button);
+    nav.appendChild(button);
+  }
+  root.append(
+    header,
+    nav,
+    dataHost,
+    crossHost,
+    portfolioHost,
+    quantHost,
+    screenerHost,
+    ledgerHost,
+    diagnosisHost,
+    workspaceHost,
+  );
+  activate(active);
+
+  return () => {
+    crossCleanup?.();
+    portfolioCleanup?.();
+    quantCleanup?.();
+    screenerCleanup?.();
+    ledgerCleanup?.();
+    diagnosisCleanup?.();
+    workspaceCleanup?.();
+  };
+}
+
+const root = document.getElementById("root");
+let cleanupShell: (() => void) | null = null;
+if (root) {
+  cleanupShell = mountShell(root);
+  // 顶层触发渲染（main 内部每条命令各自兜底，整体不会被单条失败打断）。
+  void main(root.querySelector<HTMLElement>(".stock-view") ?? root);
+}
 
 // 卸载钩子：解绑监听并拒绝在途调用，避免帧回调打在已卸载的产物上。
-window.addEventListener("beforeunload", () => client.dispose());
+window.addEventListener("beforeunload", () => {
+  cleanupShell?.();
+  client.dispose();
+});

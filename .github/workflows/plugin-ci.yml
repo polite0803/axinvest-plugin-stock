@@ -41,5 +41,7 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Lint Rust sources
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build plugin web bundle
+        run: npm run build:web --prefix plugin-stock
       - name: Build and verify plugin bundle
         run: node scripts/build-plugin-bundle.mjs --plugin "${PLUGIN_NAME}" --plugin-version "${PLUGIN_VERSION}" --check --out "dist/plugins/${PLUGIN_NAME}"
